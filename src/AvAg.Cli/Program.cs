@@ -1,7 +1,8 @@
 using System.Globalization;
 using AvAg.Core;
 using AvAg.Pipeline;
-using AvAg.Pipeline.Adapters;
+using AvAg.Pipeline.Manuals;
+using AvAg.Pipeline.Services;
 
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
 
@@ -30,24 +31,31 @@ static void Usage()
     avag — Audio-Visual Action Grounding pipeline (C#)
 
     avag run --video <file.mp4> --out <graph.json> [options]
-        --transcript <whisperx.json>   use a precomputed WhisperX JSON instead of the ASR sidecar
-        --asr-url <http://host:port>   WhisperX sidecar (default http://127.0.0.1:8011)
-        --ui-url <url>                 OmniParser+PaddleOCR sidecar (omit → no UI parsing)
-        --ui-json <elements.json>      static UI elements file (tests / golden runs)
-        --molmo-url <url>              MolmoPoint sidecar for fallback pointing
-        --qwen-url <url>               vLLM OpenAI-compatible endpoint (Qwen3-VL) for description / fallback pointing
-        --sam2-url <url>               SAM2 sidecar for target stabilisation
+        --lang <de|en|auto>            spoken language (default de; auto = detect)
         --cursor <cursor.png>          cursor template (greatly improves tracking)
-        --lang <de|en|auto>            ASR language hint (default de; auto = detect)
-        --no-diarize                   disable speaker diarization
+        --no-diarize                   disable speaker labels
         --coarse-fps <n>  --fine-fps <n>  --coarse-width <px>
         --keep                         keep intermediate frames/WAV (default: deleted for privacy)
-        --describe                     add VLM clip narratives (requires --qwen-url)
+        --describe                     add clip narratives (needs a clip describer, e.g. --qwen-url)
+
+      AI services – every capability can use any registered provider:
+        --<cap>-provider <name>  --<cap>-url <url>  --<cap>-model <name>  --<cap>-key <key>
+        with <cap> = asr | ui | grounder | tracker | describer | llm   (provider "none" switches it off)
+        Built-in providers: asr: whisperx (default, http://127.0.0.1:8011), whisperx-json
+                            ui: omniparser, ui-json        grounder: molmo, qwen-vl
+                            tracker: sam2                  describer: qwen-vl
+                            llm: openai-compatible (aliases ollama, openai, azure-openai, lm-studio, vllm)
+      Shortcuts:
+        --transcript <whisperx.json>   = --asr-provider whisperx-json (no speech service needed)
+        --ui-json <elements.json>      = --ui-provider ui-json
+        --molmo-url <url>  --sam2-url <url>  --qwen-url <url> (Qwen3-VL for narratives and fallback pointing)
+
+      Manual:
         --manual <manual.docx>         also write a step-by-step manual: .docx, .html and .md next to each other
         --manual-lang <de|en>          manual language (default: spoken language)
         --private                      private video: manual is text only, no screenshots
         --llm-url <url/v1> --llm-model <name> [--llm-key <key>]
-                                       OpenAI-compatible model that summarises the manual (default: rule-based)
+                                       language model that writes the manual (default: rule-based)
 
     avag eval --pred <graph.json> --gt <groundtruth.json> [--tol 0.25]
     avag timeline --graph <graph.json> [--lang de|en]
@@ -68,17 +76,39 @@ static Dictionary<string, string> ParseOptions(IEnumerable<string> args)
     return d;
 }
 
+/// <summary>CLI flags → the same service configuration the web app reads from appsettings.json.</summary>
+static AiServicesOptions ServicesFrom(Dictionary<string, string> o)
+{
+    var s = new AiServicesOptions();
+    if (o.TryGetValue("transcript", out var tr)) s.Asr = ServiceOptions.FromFile("whisperx-json", tr);
+    if (o.TryGetValue("ui-json", out var uj)) s.UiParser = ServiceOptions.FromFile("ui-json", uj);
+    if (o.TryGetValue("molmo-url", out var mu)) s.Grounder = new() { Provider = "molmo", Url = mu };
+    if (o.TryGetValue("sam2-url", out var su)) s.Tracker = new() { Provider = "sam2", Url = su };
+    if (o.TryGetValue("qwen-url", out var qu))
+    {
+        s.ClipDescriber = new() { Provider = "qwen-vl", Url = qu };
+        if (!o.ContainsKey("molmo-url")) s.Grounder = new() { Provider = "qwen-vl", Url = qu };
+    }
+    Apply(s.Asr, "asr"); Apply(s.UiParser, "ui"); Apply(s.Grounder, "grounder");
+    Apply(s.Tracker, "tracker"); Apply(s.ClipDescriber, "describer"); Apply(s.TextGenerator, "llm");
+    return s;
+
+    void Apply(ServiceOptions so, string cap)
+    {
+        if (o.TryGetValue($"{cap}-url", out var url)) { so.Url = url; if (so.Provider == ServiceOptions.None) so.Provider = null; }
+        if (o.TryGetValue($"{cap}-provider", out var p)) so.Provider = p;
+        if (o.TryGetValue($"{cap}-model", out var m)) so.Model = m;
+        if (o.TryGetValue($"{cap}-key", out var k)) so.ApiKey = k;
+    }
+}
+
 static async Task<int> RunAsync(Dictionary<string, string> o)
 {
     string video = Req(o, "video");
     string outPath = o.GetValueOrDefault("out", Path.ChangeExtension(video, ".events.json"));
-
-    IAsrService asr = o.TryGetValue("transcript", out var tr) ? new JsonFileAsr(tr) : new WhisperXSidecar(o.GetValueOrDefault("asr-url", "http://127.0.0.1:8011"));
-    IUiParser ui = o.TryGetValue("ui-json", out var uj) ? new JsonFileUiParser(uj)
-                 : o.TryGetValue("ui-url", out var uu) ? new OmniParserSidecar(uu) : new NullUiParser();
-    Qwen3VlClient? qwen = o.TryGetValue("qwen-url", out var qu) ? new Qwen3VlClient(qu) : null;
-    IVideoGrounder? grounder = o.TryGetValue("molmo-url", out var mu) ? new MolmoPointSidecar(mu) : qwen;
-    IObjectTracker? tracker = o.TryGetValue("sam2-url", out var su) ? new Sam2Sidecar(su) : null;
+    var factory = AiServiceFactory.CreateDefault();
+    var services = ServicesFrom(o);
+    var pipelineServices = factory.CreatePipelineServices(services);
 
     var cfg = new PipelineConfig
     {
@@ -87,11 +117,9 @@ static async Task<int> RunAsync(Dictionary<string, string> o)
         CursorTemplatePng = o.GetValueOrDefault("cursor"),
         CoarseFps = Dbl(o, "coarse-fps", 3), FineFps = Dbl(o, "fine-fps", 20), CoarseWidth = (int)Dbl(o, "coarse-width", 960),
         KeepIntermediateFiles = o.ContainsKey("keep"),
-        DescribeClips = o.ContainsKey("describe") && qwen is not null,
+        DescribeClips = o.ContainsKey("describe") && pipelineServices.ClipDescriber is not null,
     };
-    var runner = new PipelineRunner(cfg, new PipelineServices { Asr = asr, UiParser = ui, Grounder = grounder, Tracker = tracker, ClipDescriber = qwen });
-
-    var result = await runner.RunAsync(video);
+    var result = await new PipelineRunner(cfg, pipelineServices).RunAsync(video);
     foreach (var line in result.Log) Console.Error.WriteLine("  " + line);
 
     await File.WriteAllTextAsync(outPath, Json.Serialize(result.Graph));
@@ -102,10 +130,9 @@ static async Task<int> RunAsync(Dictionary<string, string> o)
 
     if (o.TryGetValue("manual", out var manualPath))
     {
-        var llm = o.TryGetValue("llm-url", out var lu)
-            ? new ManualLlmSettings { Url = lu, Model = o.GetValueOrDefault("llm-model"), ApiKey = o.GetValueOrDefault("llm-key") } : null;
-        var svc = new ManualService(llm);
-        var manual = await svc.CreateAsync(result, video, Path.GetFileName(video), o.GetValueOrDefault("manual-lang"), useLlm: llm is not null, privateVideo: o.ContainsKey("private"));
+        var svc = new ManualService(factory.CreateManualWriter(services));
+        var manual = await svc.CreateAsync(result, video, Path.GetFileName(video),
+            new ManualRequest(o.GetValueOrDefault("manual-lang"), UseWriter: true, Private: o.ContainsKey("private")));
         foreach (var line in svc.Log) Console.Error.WriteLine("  " + line);
         await File.WriteAllBytesAsync(Path.ChangeExtension(manualPath, ".docx"), ManualDocx.Write(manual));
         await File.WriteAllTextAsync(Path.ChangeExtension(manualPath, ".html"), ManualRenderer.Html(manual));

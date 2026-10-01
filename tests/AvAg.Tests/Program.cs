@@ -3,6 +3,8 @@ using System.Reflection;
 using AvAg.Core;
 using AvAg.Pipeline;
 using AvAg.Pipeline.Adapters;
+using AvAg.Pipeline.Manuals;
+using AvAg.Pipeline.Services;
 using AvAg.Pipeline.Media;
 using AvAg.Pipeline.Vision;
 
@@ -252,7 +254,7 @@ static class Tests
 
         // The video path does not exist: a text-only manual must not even try to read a frame from it.
         var svc = new ManualService();
-        var m = await svc.CreateAsync(result, "does-not-exist.mp4", "Speichern.mp4", null, useLlm: false, privateVideo: true);
+        var m = await svc.CreateAsync(result, "does-not-exist.mp4", "Speichern.mp4", new ManualRequest(Private: true));
         Assert.True(m.Private && m.Steps.Count == 1, "one private step");
         Assert.True(m.Steps.All(s => s.ScreenshotJpeg is null && s.ScreenshotS is null && s.PointXyPx is null), "no screenshot, no click position");
         Assert.True(!svc.Log.Any(l => l.Contains("screenshot at")), "no frame extraction attempted");
@@ -260,6 +262,72 @@ static class Tests
         Assert.True(!html.Contains("<img") && html.Contains("privates Video, nur Text") && html.Contains("Klicken Sie hier auf Speichern."), "html text only");
         using var zip = new System.IO.Compression.ZipArchive(new MemoryStream(ManualDocx.Write(m)));
         Assert.True(!zip.Entries.Any(x => x.FullName.StartsWith("word/media/")), "docx without images");
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Replaceable AI services
+    // --------------------------------------------------------------------------------------------
+    sealed class FakeTextGenerator(string answer) : ITextGenerator
+    {
+        public TextGenerationRequest? LastRequest { get; private set; }
+        public string Name => "fake";
+        public Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default) { LastRequest = request; return Task.FromResult(answer); }
+    }
+
+    [Test] public static void ServiceFactory_Resolves_Providers_By_Name()
+    {
+        var f = AiServiceFactory.CreateDefault();
+        Assert.True(f.Asr.Create(new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011" }) is WhisperXSidecar, "named provider");
+        Assert.True(f.UiParser.Create(new ServiceOptions { Url = "http://127.0.0.1:8003" }) is OmniParserSidecar, "Url only → default provider");
+        Assert.True(f.Grounder.Create(ServiceOptions.Off()) is null && f.Tracker.Create(new ServiceOptions()) is null, "none / empty → off");
+        Assert.True(f.TextGenerator.Create(new ServiceOptions { Provider = "ollama", Url = "http://127.0.0.1:11434/v1", Model = "m" }) is OpenAiCompatibleTextGenerator, "alias");
+        Assert.True(f.Grounder.Create(ServiceOptions.Off().WithUrl("http://127.0.0.1:8002")) is MolmoPointSidecar, "URL override switches an off capability on");
+
+        try { f.Asr.Create(new ServiceOptions { Provider = "nope", Url = "http://x" }); throw new Exception("unknown provider accepted"); }
+        catch (InvalidOperationException ex) { Assert.True(ex.Message.Contains("whisperx") && ex.Message.Contains("nope"), "error lists known providers: " + ex.Message); }
+
+        // Another AI is one registration away.
+        var custom = new FakeTextGenerator("{}");
+        f.TextGenerator.Register("my-llm", _ => custom);
+        Assert.True(f.CreateManualWriter(new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "my-llm" } }) is LlmManualWriter, "custom provider");
+        var services = f.CreatePipelineServices(new AiServicesOptions { Asr = ServiceOptions.FromFile("whisperx-json", "t.json") });
+        Assert.True(services.Asr is JsonFileAsr && services.UiParser is NullUiParser && services.Grounder is null, "pipeline services");
+    }
+
+    [Test] public static async Task LlmManualWriter_Anchors_Steps_To_Transcript_Sentences()
+    {
+        var tr = Spoken("en", (0.0, "Today we save a file."), (4.0, "Click File at the top."), (8.0, "Then press Ctrl + S to save it."));
+        var sentences = ManualBuilder.Sentences(tr);
+        var draft = new ManualBuilder().Build(tr, new AudioRefParser().Parse(tr), null, "save.mp4");
+        var llm = new FakeTextGenerator("""
+            Here you go: {"title": "Save a file", "summary": "You save a file.", "prerequisites": ["none"],
+             "steps": [{"title": "Save", "instruction": "Press Ctrl + S.", "details": null, "sentences": [3]},
+                       {"section": null, "title": "Open File", "instruction": "Click File.", "sentences": ["2"]}],
+             "tips": ["Use the toolbar instead."]}
+            """);
+        var m = await new LlmManualWriter(llm).WriteAsync(draft, sentences);
+        Assert.True(llm.LastRequest!.Json && llm.LastRequest.User.Contains("[2] (00:04) Click File at the top."), "numbered transcript in the prompt");
+        Assert.Eq("llm:fake", m.Method, "method");
+        Assert.Eq("Click File.", m.Steps[0].Instruction, "steps in video order");
+        Assert.Near(4.0, m.Steps[0].TimeS, 1e-6, "time from sentence 2, not from the model");
+        Assert.Near(8.0, m.Steps[1].TimeS, 1e-6, "time from sentence 3");
+        Assert.True(m.Prerequisites.Count == 0 && m.Tips.Count == 1, "'none' prerequisite dropped");
+
+        try { LlmManualWriter.Parse("""{"steps": [{"instruction": "Do it."}]}""", draft, sentences); throw new Exception("accepted"); }
+        catch (InvalidOperationException) { /* fewer than 2 steps / not tied to the transcript */ }
+    }
+
+    [Test] public static async Task ManualService_Keeps_Draft_When_The_Model_Fails()
+    {
+        var tr = Spoken("en", (0.0, "Today we save a file."), (4.0, "Click File at the top."));
+        var refs = new AudioRefParser().Parse(tr);
+        var graph = new EventGraphBuilder().Build(new VideoInfo("v", 10, 640, 360, 30), refs, [], [], new UiElementRegistry());
+        var result = new PipelineResult { Graph = graph, Transcript = tr, AudioRefs = refs, VisualEvents = [], TimelineDe = "", TimelineEn = "" };
+
+        var svc = new ManualService(new LlmManualWriter(new FakeTextGenerator("sorry, no JSON")));
+        var m = await svc.CreateAsync(result, "does-not-exist.mp4", "v.mp4", new ManualRequest(Private: true));
+        Assert.Eq("extractive", m.Method, "rule-based draft kept");
+        Assert.True(m.Steps.Count >= 1 && svc.Log.Any(l => l.Contains("kept the rule-based manual")), "fallback logged");
     }
 
     // --------------------------------------------------------------------------------------------

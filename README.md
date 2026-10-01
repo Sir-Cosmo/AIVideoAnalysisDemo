@@ -84,7 +84,7 @@ Drop a video on the page, press **Analyse video**, then **Create manual**.
 
 ```powershell
 dotnet build
-dotnet run --project tests/AvAg.Tests     # 16 tests, incl. an end-to-end run on a synthetic screen recording
+dotnet run --project tests/AvAg.Tests     # 19 tests, incl. an end-to-end run on a synthetic screen recording
 ```
 
 ---
@@ -129,7 +129,8 @@ Safety on small GPUs (< 8 GB):
 * The model loads in the background *after* the service started, so an accidental second copy fails on the busy
   port before it can put a second model on the GPU.
 
-**Auto-start:** `src/AvAg.Web/SidecarLauncher.cs` starts the service with `sidecars/.venv` when the web app
+**Auto-start:** `src/AvAg.Web/SidecarLauncher.cs` starts every configured service that names a `LocalModule`
+(here `whisperx_server:app`) with `sidecars/.venv` when the web app
 starts or when a job needs it, unless something already listens on the configured address. It never starts a
 second copy. Output goes to `sidecars/whisperx_server.log`.
 
@@ -173,7 +174,7 @@ English timeline, and only names a position where the evidence supports one.
 
 ## 3. How it works: the manual
 
-`src/AvAg.Pipeline/ManualService.cs` creates the manual from a finished analysis, in four stages.
+`src/AvAg.Pipeline/Manuals/ManualService.cs` creates the manual from a finished analysis, in four stages.
 
 ### 3.1 Sentences
 
@@ -183,7 +184,7 @@ run-ons are cut at 40 words, and only short fragments are glued back to the sent
 
 ### 3.2 Rule-based steps (always available)
 
-`ManualBuilder.Build` (in `src/AvAg.Core/Manual.cs`) works without any AI model:
+`ManualBuilder.Build` (in `src/AvAg.Core/Manuals/ManualBuilder.cs`) works without any AI model:
 
 * A sentence becomes a **step** if the parser found a pointer action in it, or if it contains an instruction verb
   (open, go to, save, copy, press, select … / öffnen, speichern, kopieren, drücken, wählen …) and addresses the
@@ -194,7 +195,8 @@ run-ons are cut at 40 words, and only short fragments are glued back to the sent
 
 ### 3.3 AI-written steps (when a language model is configured)
 
-The model (default: `avag-manual` = Qwen2.5 7B in Ollama, CPU only) receives the **whole transcript as numbered
+`LlmManualWriter` works with whichever language model `Services:TextGenerator` selects (default: `avag-manual` =
+Qwen2.5 7B in Ollama, CPU only). The model receives the **whole transcript as numbered
 sentences** (`[12] (00:45) Select this from rectangle to window …`). It is asked to:
 
 * write the manual for the whole video, with exactly one viewer action per step, in video order;
@@ -211,7 +213,7 @@ about 1–5 minutes, depending on the video's length.
 
 ### 3.4 Screenshots and click markers
 
-For every step (`ManualBuilder.PlaceScreenshots`, `ManualService.RefineScreenshotTimesAsync`):
+For every step (`ManualBuilder.PlaceScreenshots`, `ManualScreenshotService.RefineTimesAsync`):
 
 1. **Click marker:** if an observed click belongs to an instruction spoken *inside this step*, the screenshot is
    taken right at that click, with a red box around it (and around the UI element, if one was found). A click
@@ -320,16 +322,70 @@ Visual Studio launch profiles for AvAg.Cli: *run (offline demo)*, *eval (offline
 
 `src/AvAg.Web/appsettings.json`, section `AvAg`:
 
-| Key | Default | Meaning |
+```json
+"AvAg": {
+  "RetentionMinutes": 60,
+  "AutoStartSidecars": true,
+  "Services": {
+    "Asr":           { "Provider": "whisperx", "Url": "http://127.0.0.1:8011", "LocalModule": "whisperx_server:app" },
+    "UiParser":      { "Provider": "none" },
+    "Grounder":      { "Provider": "none" },
+    "Tracker":       { "Provider": "none" },
+    "ClipDescriber": { "Provider": "none" },
+    "TextGenerator": { "Provider": "openai-compatible", "Url": "http://127.0.0.1:11434/v1", "Model": "avag-manual", "ApiKey": "", "TimeoutSeconds": 900 }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `RetentionMinutes` | delete finished jobs after this time (default 60) |
+| `AutoStartSidecars` | start local sidecars (services with a `LocalModule` and a local `Url`) when they are not running |
+| `Services:<Capability>` | which AI implements the capability, and where it runs – see [Replaceable AI services](#71-replaceable-ai-services) |
+
+Every service entry has the same fields:
+
+| Field | Meaning |
+|---|---|
+| `Provider` | provider name (table below); `none` switches the capability off; empty = the capability's default provider when `Url`/`Path` is set |
+| `Url` | base URL of the service; for OpenAI-compatible endpoints include the version (`…/v1`) |
+| `Model` | model name, where the provider needs one |
+| `ApiKey` | only for hosted endpoints; sent as `Authorization: Bearer` and `api-key`. Put real keys in environment variables (`AvAg__Services__TextGenerator__ApiKey`) or user secrets, not in the file |
+| `Path` | input file for file-based providers (`whisperx-json`, `ui-json`) |
+| `TimeoutSeconds` | request timeout (default 1800) |
+| `LocalModule` | Python module the web app starts from `sidecars/` when the service is local and not running (`whisperx_server:app`) |
+
+Any setting can also come from environment variables, e.g. `AvAg__Services__Asr__Url=http://gpu-host:8011`.
+
+### 7.1 Replaceable AI services
+
+The pipeline never talks to a specific AI. It only uses six small interfaces
+(`src/AvAg.Core/Abstractions/AiServices.cs`); `AiServiceFactory` (`src/AvAg.Pipeline/Services/`) picks the
+implementation by the `Provider` name in the configuration:
+
+| Capability (config key) | Interface | Built-in providers |
 |---|---|---|
-| `AsrUrl` | `http://127.0.0.1:8011` | WhisperX service |
-| `AutoStartSidecars` | `true` | start `sidecars/whisperx_server.py` automatically when `AsrUrl` is local and not running |
-| `UiUrl`, `MolmoUrl`, `Sam2Url`, `QwenUrl` | empty | optional services (empty = off) |
-| `RetentionMinutes` | `60` | delete finished jobs after this time |
-| `ManualLlm.Url` | `http://127.0.0.1:11434/v1` | OpenAI-compatible endpoint (Ollama, LM Studio, vLLM, Azure OpenAI v1). Empty = rule-based manual only |
-| `ManualLlm.Model` | `avag-manual` | model name |
-| `ManualLlm.ApiKey` | empty | sent as `Authorization: Bearer` and `api-key` (only needed for hosted endpoints; do not commit real keys) |
-| `ManualLlm.TimeoutSeconds` | `900` | CPU models need several minutes for long videos |
+| Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file) |
+| UI elements + text (`UiParser`) | `IUiParser` | `omniparser` (default), `ui-json` (file) |
+| Fallback pointing (`Grounder`) | `IVideoGrounder` | `molmo` (default), `qwen-vl` |
+| Box tracking (`Tracker`) | `IObjectTracker` | `sam2` |
+| Clip narratives (`ClipDescriber`) | `IClipDescriber` | `qwen-vl` |
+| Manual writer (`TextGenerator`) | `ITextGenerator` | `openai-compatible` (aliases `ollama`, `openai`, `azure-openai`, `lm-studio`, `vllm`) |
+
+**Switching to another AI that is already supported is configuration only.** For example, to write manuals with
+a hosted OpenAI-compatible model instead of the local one:
+
+```json
+"TextGenerator": { "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "<model>", "ApiKey": "" }
+```
+
+**Adding a new AI** (a vendor with its own API, a different speech recogniser, …) takes three steps, explained with
+a full example in [`docs/ADDING_AN_AI.md`](docs/ADDING_AN_AI.md):
+1. write one class that implements the capability's interface;
+2. register it with a provider name in `AiServiceFactory.CreateDefault()` (or on the factory in `AvAg.Web/Program.cs`);
+3. select that name in `appsettings.json` (or with `--<cap>-provider` on the CLI).
+
+Nothing else in the pipeline, the web app or the manual changes.
 
 WhisperX service environment variables: `AVAG_WHISPER_MODEL` (e.g. `large-v3`, `medium`, `small`),
 `AVAG_WHISPER_DEVICE` (`cuda`/`cpu`), `AVAG_WHISPER_COMPUTE` (`float16`/`int8_float16`/`int8`),
@@ -360,22 +416,39 @@ Tested on a laptop with a 4 GB NVIDIA RTX 500 Ada GPU and 64 GB RAM. For a 2-min
 ## 9. Project layout and tests
 
 ```
-src/AvAg.Core        domain model, parser, UI registry, fusion, event graph, describer, metrics,
-                     manual model + rule-based builder + HTML/Markdown/Word writers (no I/O)
-src/AvAg.Pipeline    FFmpeg service, frame analysis, model adapters, PipelineRunner, ManualService
-src/AvAg.Cli         `avag run | eval | timeline`
-src/AvAg.Web         ASP.NET Core demo page + API, job store, SidecarLauncher
-tests/AvAg.Tests     NuGet-free test runner (16 tests: parser, fusion, metrics, vision, manual, end-to-end)
-sidecars/            whisperx_server.py, manual-llm.Modelfile, optional molmo/omniparser/sam2 servers
-deploy/              docker-compose.yml for a Linux GPU host
-samples/             synthetic demo video, transcript, UI elements, ground truth
-docs/ROADMAP.md      phased plan, hardware, datasets
+src/AvAg.Core                      pure logic, no I/O
+  Abstractions/AiServices.cs       the replaceable AI interfaces (IAsrService, ITextGenerator, IManualWriter, …)
+  Models.cs, AudioRefParser.cs, UiElementRegistry.cs, Fusion.cs, Describer.cs, Metrics.cs
+  Manuals/                         Manual model, ManualBuilder (rule-based steps, screenshot planning),
+                                   ManualRenderer (HTML, Markdown), ManualDocx (Word)
+src/AvAg.Pipeline                  everything that touches files, processes or the network
+  PipelineRunner.cs                the analysis, step by step
+  Media/, Vision/                  FFmpeg, frame differencing, cursor tracking, click detection
+  Adapters/<capability>/           one file per AI implementation (WhisperX, OmniParser, Molmo, SAM2, Qwen-VL,
+                                   OpenAI-compatible text generation) + HttpServiceClient base
+  Services/                        AiServicesOptions (configuration) + AiServiceFactory (provider registry)
+  Manuals/                         ManualService (orchestration), LlmManualWriter (prompt + answer parsing),
+                                   ManualScreenshotService (frame choice + extraction)
+src/AvAg.Cli                       `avag run | eval | timeline`
+src/AvAg.Web                       Program.cs (wiring only), Endpoints/ (jobs, manual), JobRunner, Jobs (store,
+                                   settings, clean-up), SidecarLauncher, wwwroot/index.html
+tests/AvAg.Tests                   NuGet-free test runner (19 tests)
+sidecars/                          whisperx_server.py, manual-llm.Modelfile, optional molmo/omniparser/sam2 servers
+deploy/                            docker-compose.yml for a Linux GPU host
+samples/                           synthetic demo video, transcript, UI elements, ground truth
+docs/                              ADDING_AN_AI.md, ROADMAP.md
 ```
+
+Dependencies point one way: `Web`/`Cli` → `Pipeline` → `Core`. Core has no knowledge of any model, file or
+service, so it can be tested and reused on its own.
 
 `dotnet run --project tests/AvAg.Tests` runs all tests. The end-to-end test synthesises a 640×360 recording
 where the cursor clicks a „Speichern“ button, and checks that the click is found at 12.70 ± 0.12 s, inside the
 button, and bound to the spoken instruction. The manual tests cover step extraction, click markers, sections,
-key combinations, Word output, and that a private manual never reads a frame from the video.
+key combinations, Word output, and that a private manual never reads a frame from the video. The service tests
+check provider selection by name, that a new AI can be registered, that the language-model writer ties every step
+to real transcript sentences (using a fake model, no network), and that a failing model falls back to the
+rule-based manual.
 
 ---
 
@@ -387,7 +460,7 @@ key combinations, Word output, and that a private manual never reads a frame fro
 | English video transcribed as German | Set the spoken language to **Auto-detect** (the default) or `--lang auto`. |
 | "GPU out of memory" / laptop freezes during transcription | Set `AVAG_WHISPER_BATCH=1`, a smaller model (`AVAG_WHISPER_MODEL=small`) or `AVAG_WHISPER_DEVICE=cpu`. Never run two copies of the service. |
 | Manual says "kept the rule-based manual" | Ollama is not running, or the model answer was unusable. Check `ollama list` (needs `avag-manual`) and http://127.0.0.1:11434. |
-| Manual takes very long | The model runs on the CPU on purpose. Use a smaller model in the Modelfile (e.g. `qwen2.5:3b`, faster but noticeably worse) or point `ManualLlm` to a faster endpoint. |
+| Manual takes very long | The model runs on the CPU on purpose. Use a smaller model in the Modelfile (e.g. `qwen2.5:3b`, faster but noticeably worse) or point `Services:TextGenerator` to a faster endpoint. |
 | Build error "file is locked by AvAg.Web" | Stop the running web app (Visual Studio: Stop debugging) and build again. |
 | `torchcodec` warnings in the WhisperX log | Harmless: audio is passed to pyannote as an in-memory waveform. |
 

@@ -1,35 +1,34 @@
 using System.Collections.Concurrent;
 using AvAg.Pipeline;
+using AvAg.Pipeline.Services;
 
 namespace AvAg.Web;
 
+/// <summary>appsettings.json section "AvAg".</summary>
 public sealed class WebSettings
 {
-    public string? AsrUrl { get; set; } = "http://127.0.0.1:8011";
-    public string? UiUrl { get; set; } = "http://127.0.0.1:8003";
-    public string? MolmoUrl { get; set; }
-    public string? Sam2Url { get; set; }
-    public string? QwenUrl { get; set; }
+    /// <summary>Which AI implements each capability and where it runs. See AiServicesOptions / AiServiceFactory.</summary>
+    public AiServicesOptions Services { get; set; } = new();
     /// <summary>Uploads, frames and results are deleted this many minutes after the job finished (privacy).</summary>
     public int RetentionMinutes { get; set; } = 60;
-    /// <summary>Start sidecars/whisperx_server.py with the web app when AsrUrl is local and not already running.</summary>
+    /// <summary>Start local sidecars (services with a LocalModule and a local Url) when they are not running.</summary>
     public bool AutoStartSidecars { get; set; } = true;
-    /// <summary>Optional OpenAI-compatible language model that summarises the manual; empty Url = rule-based manual.</summary>
-    public ManualLlmSettings ManualLlm { get; set; } = new();
     public string UploadRoot { get; set; } = Path.Combine(Path.GetTempPath(), "avag-web");
 }
 
+/// <summary>Per-job settings: the configured services with this upload's overrides applied.</summary>
 public sealed class RunOptions
 {
-    public string? AsrUrl { get; init; }
-    public string? UiUrl { get; init; }
-    public string? MolmoUrl { get; init; }
-    public string? Sam2Url { get; init; }
-    public string? QwenUrl { get; init; }
+    public required AiServicesOptions Services { get; init; }
+    /// <summary>Resolved provider and endpoint per capability (from AiServiceFactory.Describe) – shown in the status, never API keys.</summary>
+    public IReadOnlyDictionary<string, string?> ServiceSummary { get; init; } = new Dictionary<string, string?>();
     public string? Language { get; init; }   // null = detect
     public bool Diarize { get; init; } = true;
     public double CoarseFps { get; init; } = 3;
     public double FineFps { get; init; } = 20;
+
+    /// <summary>For the status API.</summary>
+    public object Describe() => new { language = Language, diarize = Diarize, coarse_fps = CoarseFps, fine_fps = FineFps, services = ServiceSummary };
 }
 
 public enum JobState { Queued, Running, Done, Failed }
@@ -42,8 +41,6 @@ public sealed class Job
     public DateTimeOffset? Finished { get; private set; }
     public string? VideoPath { get; set; }
     public string? VideoName { get; set; }
-    public string? TranscriptPath { get; set; }
-    public string? UiJsonPath { get; set; }
     public string? CursorPath { get; set; }
     public RunOptions? Options { get; set; }
     public CancellationTokenSource Cancel { get; } = new();
@@ -71,18 +68,20 @@ public sealed class Job
         timeline_de = Result?.TimelineDe, timeline_en = Result?.TimelineEn,
         audio_refs = Result?.AudioRefs.Select(a => new { a.Id, a.StartS, a.EndS, a.AnchorS, a.Text, a.Action, a.Deictic, a.ExplicitTarget, a.SpeakerId }),
         transcript = Result?.Transcript.Segments.Select(s => new { s.StartS, s.EndS, s.Text, s.Speaker }),
-        inputs = new { transcript = TranscriptPath is not null, ui_json = UiJsonPath is not null, cursor = CursorPath is not null, options = Options },
+        inputs = new { cursor = CursorPath is not null, options = Options?.Describe() },
     };
 }
 
 public sealed class JobStore
 {
     private readonly ConcurrentDictionary<string, Job> _jobs = new();
+    private readonly WebSettings _settings;
+    public JobStore(WebSettings settings) => _settings = settings;
 
-    public Job Create(WebSettings cfg)
+    public Job Create()
     {
         var id = Guid.NewGuid().ToString("N")[..12];
-        var dir = Path.Combine(cfg.UploadRoot, id);
+        var dir = Path.Combine(_settings.UploadRoot, id);
         Directory.CreateDirectory(dir);
         var job = new Job { Id = id, Dir = dir };
         _jobs[id] = job;
@@ -108,10 +107,11 @@ public sealed class JobJanitor : BackgroundService
 {
     private readonly JobStore _store;
     private readonly int _retentionMinutes;
-    public JobJanitor(JobStore store, IConfiguration config)
+
+    public JobJanitor(JobStore store, WebSettings settings)
     {
         _store = store;
-        _retentionMinutes = config.GetSection("AvAg").Get<WebSettings>()?.RetentionMinutes ?? 60;
+        _retentionMinutes = settings.RetentionMinutes;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
