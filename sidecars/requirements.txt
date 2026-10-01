@@ -1,0 +1,16 @@
+# Pin versions on your own machine after a successful install; these are the package names only.
+fastapi
+uvicorn[standard]
+pydantic>=2
+# ASR
+whisperx            # BSD-2-Clause; pulls faster-whisper, pyannote.audio (HF token needed for diarization models)
+torch
+# VLM / pointing
+transformers>=4.50
+accelerate
+# UI parsing + OCR
+paddlepaddle-gpu    # or paddlepaddle for CPU
+paddleocr>=2.8
+pillow
+# SAM2: pip install git+https://github.com/facebookresearch/sam2.git  (+ download checkpoints)
+# OmniParser: git clone https://github.com/microsoft/OmniParser into $OMNIPARSER_HOME and download weights

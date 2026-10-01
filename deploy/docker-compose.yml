@@ -1,0 +1,49 @@
+# On-prem deployment: C# orchestrator + Python model sidecars on one GPU host (no external API calls).
+# Models/weights are mounted read-only; videos are mounted read-only; outputs go to ./out.
+services:
+  whisperx:
+    build: { context: ../sidecars, dockerfile: Dockerfile.sidecar }
+    command: uvicorn whisperx_server:app --host 0.0.0.0 --port 8011
+    environment: { AVAG_WHISPER_MODEL: large-v3, HF_TOKEN: "${HF_TOKEN}" }
+    volumes: ["../data/videos:/data/videos:ro", "models_cache:/root/.cache"]
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  molmo:
+    build: { context: ../sidecars, dockerfile: Dockerfile.sidecar }
+    command: uvicorn molmo_server:app --host 0.0.0.0 --port 8002
+    environment: { AVAG_MOLMO_MODEL: allenai/Molmo2-VideoPoint-4B }
+    volumes: ["../data/videos:/data/videos:ro", "models_cache:/root/.cache"]
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  omniparser:
+    build: { context: ../sidecars, dockerfile: Dockerfile.sidecar }
+    command: uvicorn omniparser_server:app --host 0.0.0.0 --port 8003
+    environment: { OMNIPARSER_HOME: /opt/OmniParser, AVAG_OCR_LANG: german }
+    volumes: ["../third_party/OmniParser:/opt/OmniParser:ro", "../data/work:/data/work"]
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  sam2:
+    build: { context: ../sidecars, dockerfile: Dockerfile.sidecar }
+    command: uvicorn sam2_server:app --host 0.0.0.0 --port 8004
+    volumes: ["../data/videos:/data/videos:ro", "../third_party/sam2:/opt/sam2:ro"]
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  # Optional generalist VLM (Qwen3-VL) via vLLM's OpenAI-compatible server
+  qwen3vl:
+    image: vllm/vllm-openai:latest
+    command: >
+      --model Qwen/Qwen3-VL-8B-Instruct --max-model-len 65536
+      --allowed-local-media-path /data/videos --port 8005
+    volumes: ["../data/videos:/data/videos:ro", "models_cache:/root/.cache"]
+    deploy: { resources: { reservations: { devices: [{ driver: nvidia, count: 1, capabilities: [gpu] }] } } }
+
+  avag:
+    build: { context: .., dockerfile: deploy/Dockerfile.avag }
+    depends_on: [whisperx, omniparser]
+    volumes: ["../data/videos:/data/videos:ro", "../data/work:/data/work", "../out:/out"]
+    entrypoint: ["avag"]
+    # example: docker compose run avag run --video /data/videos/demo.mp4 --out /out/demo.json \
+    #            --asr-url http://whisperx:8011 --ui-url http://omniparser:8003 --molmo-url http://molmo:8002 --sam2-url http://sam2:8004
+
+volumes:
+  models_cache: {}

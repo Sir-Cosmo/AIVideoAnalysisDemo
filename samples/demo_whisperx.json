@@ -1,0 +1,6 @@
+{"language":"de","segments":[
+ {"start":2.0,"end":3.1,"text":"Das Programm ist jetzt geöffnet.","speaker":"SPEAKER_00",
+  "words":[{"word":"Das","start":2.0,"end":2.2,"score":0.9,"speaker":"SPEAKER_00"},{"word":"Programm","start":2.2,"end":2.6,"score":0.9,"speaker":"SPEAKER_00"},{"word":"ist","start":2.6,"end":2.7,"score":0.9,"speaker":"SPEAKER_00"},{"word":"jetzt","start":2.7,"end":2.9,"score":0.9,"speaker":"SPEAKER_00"},{"word":"geöffnet.","start":2.9,"end":3.1,"score":0.9,"speaker":"SPEAKER_00"}]},
+ {"start":12.22,"end":12.58,"text":"Klicken Sie hier.","speaker":"SPEAKER_00",
+  "words":[{"word":"Klicken","start":12.22,"end":12.38,"score":0.97,"speaker":"SPEAKER_00"},{"word":"Sie","start":12.38,"end":12.45,"score":0.95,"speaker":"SPEAKER_00"},{"word":"hier.","start":12.45,"end":12.58,"score":0.96,"speaker":"SPEAKER_00"}]}
+]}

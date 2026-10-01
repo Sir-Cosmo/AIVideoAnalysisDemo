@@ -1,0 +1,18 @@
+.vs/
+bin/
+obj/
+*.user
+*.suo
+out/
+data/
+samples/demo.events*.json
+samples/*.timeline.*.txt
+sidecars/*.log
+# Python sidecar environment and caches
+sidecars/.venv/
+__pycache__/
+*.pyc
+# stray folders from a failed brace-expansion mkdir
+/{avag/
+# personal Claude Code settings
+.claude/settings.local.json

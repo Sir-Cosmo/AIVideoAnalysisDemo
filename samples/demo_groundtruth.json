@@ -1,0 +1,19 @@
+{
+  "video_id": "demo",
+  "words": [],
+  "events": [
+    {
+      "video_id": "demo",
+      "speaker": "SPEAKER_00",
+      "action_utterance": "Klicken Sie hier.",
+      "utterance_start_s": 12.22,
+      "utterance_end_s": 12.58,
+      "event_time_s": 12.71,
+      "event_type": "click",
+      "point": [496, 264],
+      "target_bbox": [440, 240, 560, 290],
+      "ui_target_text": "Speichern",
+      "observable": true
+    }
+  ]
+}

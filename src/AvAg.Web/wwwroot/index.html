@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AvAg — audio-visual action grounding demo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1c2230; --panel: #262e3d; --panel-2: #2d3647; --line: #3a4559;
+    --text: #eceff4; --muted: #98a2b8; --faint: #6d778c;
+    --observed: #45c9a5; --tracked: #6ca6f5; --inferred: #f0b44c; --unobservable: #e86f7c; --speech: #c7a4ff;
+    --radius: 6px;
+    font-size: 15px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font-family: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.45; }
+  a { color: var(--tracked); }
+  button, input, select { font: inherit; }
+  :focus-visible { outline: 2px solid var(--tracked); outline-offset: 2px; }
+
+  header { display: flex; align-items: baseline; gap: 1.25rem; padding: 1rem 1.5rem .75rem; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 1.15rem; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  header p { margin: 0; color: var(--muted); max-width: 60ch; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr); gap: 1.5rem; padding: 1.25rem 1.5rem 3rem; max-width: 1600px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  /* ---------- upload ---------- */
+  form.upload { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 1rem 1.1rem; display: grid; gap: .75rem; grid-template-columns: 1fr 1fr; }
+  form.upload .full { grid-column: 1 / -1; }
+  label.field { display: grid; gap: .3rem; color: var(--muted); font-size: .9rem; }
+  label.field input[type=file] { color: var(--text); }
+  label.field.private { color: var(--text); }
+  label.field.private input { margin-right: .4rem; }
+  label.field input[type=text], label.field select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: .4rem .55rem; }
+  .drop { border: 1.5px dashed var(--line); border-radius: var(--radius); padding: 1.1rem; text-align: center; color: var(--muted); cursor: pointer; transition: border-color .15s, background .15s; }
+  .drop.over, .drop:hover { border-color: var(--tracked); background: var(--panel-2); }
+  .drop strong { color: var(--text); font-weight: 500; }
+  details.advanced { grid-column: 1 / -1; color: var(--muted); }
+  details.advanced summary { cursor: pointer; }
+  details.advanced .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: .75rem; margin-top: .75rem; }
+  .actions { grid-column: 1 / -1; display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+  .btn { background: var(--observed); color: #0f1a16; border: 0; border-radius: 4px; padding: .55rem 1rem; font-weight: 600; cursor: pointer; }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn.quiet { background: transparent; color: var(--text); border: 1px solid var(--line); font-weight: 500; }
+  .note { color: var(--muted); font-size: .9rem; }
+  .error { color: var(--unobservable); }
+
+  /* ---------- stage (video + overlay) ---------- */
+  .stage { position: relative; background: #000; border-radius: var(--radius); overflow: hidden; margin-top: 1.25rem; aspect-ratio: 16 / 9; }
+  .stage video { display: block; width: 100%; height: 100%; object-fit: contain; }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  .stage .empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--faint); }
+  .status { display: flex; gap: 1rem; align-items: baseline; margin-top: .6rem; color: var(--muted); font-size: .92rem; min-height: 1.4rem; }
+  .status .state { color: var(--text); font-weight: 500; }
+  .status .state.running::after { content: ""; display: inline-block; width: .6em; height: .6em; margin-left: .5em; border-radius: 50%; background: var(--inferred); animation: pulse 1s infinite alternate; }
+  @keyframes pulse { to { opacity: .3; } }
+  @media (prefers-reduced-motion: reduce) { .status .state.running::after { animation: none; } }
+  .log { font-size: .85rem; color: var(--faint); white-space: pre-wrap; margin: .4rem 0 0; max-height: 7rem; overflow: auto; }
+
+  /* ---------- timeline ---------- */
+  aside h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .6rem; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: .35rem 1rem; color: var(--muted); font-size: .85rem; margin-bottom: .75rem; }
+  .legend span::before, .ev::before { content: ""; display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; margin-right: .45rem; background: var(--c, var(--faint)); vertical-align: 0; }
+  ol.timeline { list-style: none; margin: 0; padding: 0; border-left: 2px solid var(--line); }
+  .ev { position: relative; display: block; width: 100%; text-align: left; background: none; border: 0; color: var(--text); padding: .55rem .75rem .55rem 1rem; cursor: pointer; border-radius: 0 var(--radius) var(--radius) 0; }
+  .ev::before { position: absolute; left: -7px; top: .95rem; width: .75rem; height: .75rem; margin: 0; border: 2px solid var(--bg); }
+  .ev:hover { background: var(--panel); }
+  .ev.active { background: var(--panel-2); }
+  .ev time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .88rem; margin-right: .5rem; }
+  .ev .what { font-weight: 500; }
+  .ev .sub { color: var(--muted); font-size: .9rem; display: block; margin-top: .1rem; }
+  .ev.speech .what { color: var(--speech); font-weight: 400; font-style: italic; }
+  .pill { display: inline-block; font-size: .78rem; padding: .05rem .45rem; border-radius: 999px; border: 1px solid var(--c, var(--line)); color: var(--c, var(--muted)); margin-left: .4rem; vertical-align: 1px; }
+
+  /* ---------- detail ---------- */
+  section.detail { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr); gap: 1.5rem; }
+  @media (max-width: 980px) { section.detail { grid-template-columns: 1fr; } }
+  .detail h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .5rem; color: var(--muted); }
+  .desc { font-size: 1.05rem; max-width: 70ch; margin: 0 0 .75rem; }
+  .desc.hedged { border-left: 3px solid var(--inferred); padding-left: .75rem; }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; margin: 0; font-size: .92rem; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+  .evidence { display: flex; flex-wrap: wrap; gap: .4rem; margin: .5rem 0 0; padding: 0; list-style: none; }
+  .evidence li { border: 1px solid var(--line); border-radius: 4px; padding: .2rem .5rem; font-size: .85rem; color: var(--muted); }
+  .evidence li b { color: var(--text); font-weight: 500; }
+  .bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: .25rem; }
+  .bar i { display: block; height: 100%; background: var(--c, var(--observed)); }
+  pre.json { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: .9rem; font-size: .8rem; line-height: 1.4; overflow: auto; max-height: 28rem; margin: 0; }
+  .downloads { display: flex; gap: 1rem; font-size: .9rem; margin: .5rem 0 0; }
+  /* ---------- full transcript ---------- */
+  section.transcript { grid-column: 1 / -1; }
+  section.transcript h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .5rem; color: var(--muted); display: flex; gap: 1rem; align-items: baseline; flex-wrap: wrap; }
+  section.transcript h2 .downloads { margin: 0; font-weight: 400; }
+  ol.segments { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); max-height: 32rem; overflow: auto; }
+  .seg { display: grid; grid-template-columns: 6.5rem 1fr; gap: .75rem; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); color: var(--text); padding: .45rem .8rem; cursor: pointer; }
+  .seg:hover, .seg.active { background: var(--panel-2); }
+  .seg time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .88rem; }
+  .seg .spk { color: var(--speech); font-size: .85rem; margin-right: .4rem; }
+  /* ---------- manual ---------- */
+  section.manual { grid-column: 1 / -1; }
+  section.manual h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .5rem; color: var(--muted); }
+  .manual-bar { display: flex; gap: .75rem 1rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
+  .manual-bar label { color: var(--muted); font-size: .9rem; display: flex; gap: .4rem; align-items: center; }
+  .manual-bar select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .5rem; }
+  iframe.manual-view { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: var(--radius); background: #fff; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>AvAg demo</h1>
+  <p>Upload a screen recording. The pipeline finds the spoken instruction, the real click, and the UI element under it — and tells you how sure it is.</p>
+</header>
+
+<main>
+  <div>
+    <form class="upload" id="form">
+      <div class="full drop" id="drop" tabindex="0" role="button" aria-label="Choose a video">
+        <strong id="dropText">Drop a video here or click to choose</strong>
+        <div class="note">MP4, MOV, MKV or WebM. Processing happens on this machine; files are deleted after <span id="retention">60</span> minutes.</div>
+        <input type="file" id="video" name="video" accept="video/*" class="hidden">
+      </div>
+
+      <label class="field">Transcript (WhisperX JSON, optional — skips the speech-recognition service)
+        <input type="file" name="transcript" accept=".json">
+      </label>
+      <label class="field">UI elements (JSON, optional — skips the screen-parsing service)
+        <input type="file" name="ui_json" accept=".json">
+      </label>
+
+      <label class="field full private"><span><input type="checkbox" name="private" value="true" id="privateUpload"> Private video — the manual is text only, no screenshots are taken from the video</span></label>
+
+      <details class="advanced">
+        <summary>Services and analysis settings</summary>
+        <div class="grid">
+          <label class="field">Speech recognition (WhisperX) <input type="text" name="asr_url" id="asr_url" placeholder="http://127.0.0.1:8011"></label>
+          <label class="field">Screen parsing (OmniParser + PaddleOCR) <input type="text" name="ui_url" id="ui_url" placeholder="http://127.0.0.1:8003"></label>
+          <label class="field">Fallback pointing (MolmoPoint) <input type="text" name="molmo_url" id="molmo_url" placeholder="leave empty to disable"></label>
+          <label class="field">Track stabilisation (SAM2) <input type="text" name="sam2_url" id="sam2_url" placeholder="leave empty to disable"></label>
+          <label class="field">Generalist VLM (Qwen3-VL via vLLM) <input type="text" name="qwen_url" id="qwen_url" placeholder="leave empty to disable"></label>
+          <label class="field">Cursor template (PNG, optional) <input type="file" name="cursor" accept=".png"></label>
+          <label class="field">Spoken language
+            <select name="lang"><option value="">Auto-detect</option><option value="de">German</option><option value="en">English</option></select>
+          </label>
+          <label class="field">Coarse / fine analysis fps
+            <span style="display:flex;gap:.5rem"><input type="text" name="coarse_fps" value="3" style="width:5rem"><input type="text" name="fine_fps" value="20" style="width:5rem"></span>
+          </label>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button class="btn" id="run" type="submit" disabled>Analyse video</button>
+        <button class="btn quiet" id="demo" type="button">Try the bundled sample</button>
+        <span class="note" id="formNote"></span>
+      </div>
+    </form>
+
+    <div class="stage" id="stage">
+      <video id="player" controls preload="metadata" class="hidden"></video>
+      <canvas id="overlay"></canvas>
+      <div class="empty" id="stageEmpty">Your video and the grounded clicks will appear here.</div>
+    </div>
+    <div class="status"><span class="state" id="state"></span><span id="statusText"></span></div>
+    <pre class="log" id="log"></pre>
+  </div>
+
+  <aside>
+    <h2>What happened, in order</h2>
+    <div class="legend">
+      <span style="--c:var(--speech)">spoken instruction</span>
+      <span style="--c:var(--observed)">observed</span>
+      <span style="--c:var(--tracked)">tracked</span>
+      <span style="--c:var(--inferred)">inferred</span>
+      <span style="--c:var(--unobservable)">not observable</span>
+    </div>
+    <ol class="timeline" id="timeline"></ol>
+    <p class="note" id="timelineEmpty">Nothing analysed yet.</p>
+  </aside>
+
+  <section class="detail hidden" id="detail">
+    <div>
+      <h2>Selected event</h2>
+      <p class="desc" id="descDe"></p>
+      <p class="desc note" id="descEn"></p>
+      <dl class="facts" id="facts"></dl>
+      <h2 style="margin-top:1rem">Evidence</h2>
+      <ul class="evidence" id="evidence"></ul>
+    </div>
+    <div>
+      <h2>Event graph (JSON)</h2>
+      <pre class="json" id="json"></pre>
+      <div class="downloads">
+        <a id="dlJson" download="events.json">Download graph.json</a>
+        <a id="dlDe" download="timeline.de.txt">Timeline (DE)</a>
+        <a id="dlEn" download="timeline.en.txt">Timeline (EN)</a>
+      </div>
+    </div>
+  </section>
+
+  <section class="manual hidden" id="manualSection">
+    <h2>Manual — the video as step-by-step instructions</h2>
+    <div class="manual-bar">
+      <label>Language <select id="manualLang"><option value="">Same as spoken</option><option value="de">German</option><option value="en">English</option></select></label>
+      <label title="No frame of the video is extracted; the manual only explains in text"><input type="checkbox" id="manualPrivate"> Private — text only, no screenshots</label>
+      <label id="llmLabel" class="hidden"><input type="checkbox" id="manualLlm" checked> Summarise with <span id="llmName"></span></label>
+      <button class="btn" id="makeManual" type="button">Create manual</button>
+      <span class="note" id="manualNote"></span>
+      <span class="downloads hidden" id="manualDownloads"><a id="dlDocx">Word (.docx)</a><a id="dlHtml" target="_blank">Open as web page (print → PDF)</a><a id="dlMd">Markdown</a></span>
+    </div>
+    <iframe class="manual-view hidden" id="manualView" title="Manual preview"></iframe>
+  </section>
+
+  <section class="transcript hidden" id="transcriptSection">
+    <h2><span>Transcript <span class="note" id="transcriptMeta"></span></span>
+      <span class="downloads"><a id="dlTxt" download="transcript.txt">Download .txt</a><a id="dlSrt" download="transcript.srt">Download .srt</a></span></h2>
+    <ol class="segments" id="segments"></ol>
+  </section>
+</main>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const form = $('form'), videoInput = $('video'), drop = $('drop'), runBtn = $('run'), demoBtn = $('demo');
+  const player = $('player'), overlay = $('overlay'), ctx = overlay.getContext('2d');
+  const statusColor = { observed: '--observed', tracked: '--tracked', inferred: '--inferred', unobservable: '--unobservable' };
+  let job = null, graph = null, items = [], activeIdx = -1, pollTimer = null;
+
+  // ---- config defaults ----
+  fetch('/api/config').then(r => r.json()).then(c => {
+    $('asr_url').value = c.asr_url || ''; $('ui_url').value = c.ui_url || ''; $('molmo_url').value = c.molmo_url || '';
+    $('sam2_url').value = c.sam2_url || ''; $('qwen_url').value = c.qwen_url || ''; $('retention').textContent = c.retention_minutes;
+    if (!c.has_demo) demoBtn.classList.add('hidden');
+    if (c.manual_llm) { $('llmName').textContent = c.manual_llm; $('llmLabel').classList.remove('hidden'); }
+  });
+
+  // ---- drop zone ----
+  drop.addEventListener('click', () => videoInput.click());
+  drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); videoInput.click(); } });
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => { if (e.dataTransfer.files[0]) { videoInput.files = e.dataTransfer.files; videoChosen(); } });
+  videoInput.addEventListener('change', videoChosen);
+  function videoChosen() {
+    const f = videoInput.files[0]; if (!f) return;
+    $('dropText').textContent = `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+    runBtn.disabled = false;
+    showVideo(URL.createObjectURL(f)); resetResults();
+  }
+
+  // ---- submit ----
+  form.addEventListener('submit', e => { e.preventDefault(); submit(new FormData(form)); });
+  demoBtn.addEventListener('click', () => { const fd = new FormData(form); fd.delete('video'); fd.set('use_demo', 'true'); submit(fd); });
+
+  async function submit(fd) {
+    runBtn.disabled = true; demoBtn.disabled = true; $('formNote').textContent = ''; resetResults();
+    setState('Uploading', '');
+    const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const body = await r.json();
+    if (!r.ok) { setState('', ''); $('formNote').innerHTML = `<span class="error">${esc(body.error)}</span>`; runBtn.disabled = !videoInput.files[0]; demoBtn.disabled = false; return; }
+    job = body.id;
+    showVideo(`/api/jobs/${job}/video`);
+    setState('Analysing', 'running');
+    poll();
+  }
+
+  async function poll() {
+    const r = await fetch(`/api/jobs/${job}`); if (!r.ok) { setState('Lost job', ''); return; }
+    const s = await r.json();
+    $('log').textContent = (s.log || []).join('\n');
+    if (s.state === 'done') { setState('Done', ''); render(s); runBtn.disabled = !videoInput.files[0]; demoBtn.disabled = false; }
+    else if (s.state === 'failed') { setState('Failed', ''); $('statusText').innerHTML = `<span class="error">${esc(s.error)}</span>`; runBtn.disabled = !videoInput.files[0]; demoBtn.disabled = false; }
+    else { setState(s.state === 'running' ? 'Analysing' : 'Queued', 'running'); pollTimer = setTimeout(poll, 800); }
+  }
+
+  function setState(text, cls) { $('state').textContent = text; $('state').className = 'state ' + cls; $('statusText').textContent = ''; }
+  // ---- manual ----
+  $('makeManual').addEventListener('click', async () => {
+    const btn = $('makeManual'); btn.disabled = true;
+    const fd = new FormData(); fd.set('lang', $('manualLang').value); fd.set('private', String($('manualPrivate').checked)); fd.set('llm', String(!$('llmLabel').classList.contains('hidden') && $('manualLlm').checked));
+    // The language model runs on the CPU and needs a few minutes – show that something is happening.
+    const what = fd.get('llm') === 'true' ? 'The language model is writing the manual (runs on the CPU, usually 2–5 min)' : 'Writing the manual';
+    const t0 = Date.now(), tick = () => { const s = Math.round((Date.now() - t0) / 1000); $('manualNote').textContent = `${what}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+    tick(); const timer = setInterval(tick, 1000);
+    try {
+      const r = await fetch(`/api/jobs/${job}/manual`, { method: 'POST', body: fd }); const b = await r.json(); clearInterval(timer);
+      if (!r.ok) throw new Error(b.error || r.statusText);
+      const fallback = (b.log || []).find(l => l.includes('kept the rule-based'));
+      $('manualNote').textContent = `${b.steps} steps${b.private ? ' · text only (private video)' : ''}${fallback ? ' · ' + fallback.replace('manual: ', '') : ''}`;
+      $('dlDocx').href = `/api/jobs/${job}/manual.docx`; $('dlMd').href = `/api/jobs/${job}/manual.md`; $('dlHtml').href = `/api/jobs/${job}/manual.html`;
+      $('manualDownloads').classList.remove('hidden');
+      $('manualView').src = `/api/jobs/${job}/manual.html?t=${Date.now()}`; $('manualView').classList.remove('hidden');
+    } catch (e) { clearInterval(timer); $('manualNote').innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+    btn.disabled = false;
+  });
+
+  function resetResults() { $('manualSection').classList.add('hidden'); $('manualView').classList.add('hidden'); $('manualDownloads').classList.add('hidden'); $('manualNote').textContent = ''; graph = null; items = []; activeIdx = -1; $('timeline').innerHTML = ''; $('segments').innerHTML = ''; $('transcriptSection').classList.add('hidden'); $('timelineEmpty').classList.remove('hidden'); $('detail').classList.add('hidden'); draw(); clearTimeout(pollTimer); }
+  function showVideo(src) { player.src = src; player.classList.remove('hidden'); $('stageEmpty').classList.add('hidden'); }
+
+  // ---- results ----
+  function renderTranscript(segs) {
+    const ol = $('segments'); ol.innerHTML = '';
+    (segs || []).forEach(s => {
+      const li = document.createElement('li'); const b = document.createElement('button'); b.type = 'button'; b.className = 'seg'; b.dataset.t = s.start_s;
+      b.innerHTML = `<time>${ts(s.start_s)}</time><span>${s.speaker ? `<span class="spk">${esc(s.speaker)}</span>` : ''}${esc(s.text)}</span>`;
+      b.addEventListener('click', () => { if (player.src) { player.currentTime = s.start_s; player.play(); } });
+      li.appendChild(b); ol.appendChild(li);
+    });
+    $('transcriptMeta').textContent = segs?.length ? `· ${segs.length} segments` : '· no speech recognised';
+    $('dlTxt').href = `/api/jobs/${job}/transcript.txt`; $('dlSrt').href = `/api/jobs/${job}/transcript.srt`;
+    $('transcriptSection').classList.remove('hidden');
+  }
+  // Highlight the transcript line under the playhead.
+  player.addEventListener('timeupdate', () => {
+    const segs = [...document.querySelectorAll('.seg')]; let cur = null;
+    for (const b of segs) { if (+b.dataset.t <= player.currentTime) cur = b; else break; }
+    segs.forEach(b => b.classList.toggle('active', b === cur));
+  });
+
+  function render(s) {
+    renderTranscript(s.transcript);
+    $('manualSection').classList.remove('hidden');
+    // Private uploads stay private: the manual can only be text.
+    $('manualPrivate').checked = !!s.private; $('manualPrivate').disabled = !!s.private;
+    graph = s.graph; if (!graph) return;
+    items = [];
+    graph.events.forEach((e, i) => {
+      e.audio_references.forEach(a => items.push({ kind: 'speech', t: a.start_s, end: a.end_s, text: a.transcript, speaker: a.speaker_id, eventIdx: i }));
+      items.push({ kind: 'event', t: e.temporal.peak_s, e, eventIdx: i });
+    });
+    (graph.unbound_audio_references || []).forEach(a => items.push({ kind: 'speech', t: a.start_s, end: a.end_s, text: a.transcript, speaker: a.speaker_id, unbound: true }));
+    items.sort((a, b) => a.t - b.t);
+
+    const ol = $('timeline'); ol.innerHTML = '';
+    items.forEach((it, idx) => {
+      const li = document.createElement('li'); const b = document.createElement('button'); b.type = 'button'; b.dataset.idx = idx;
+      if (it.kind === 'speech') {
+        b.className = 'ev speech'; b.style.setProperty('--c', 'var(--speech)');
+        b.innerHTML = `<time>${ts(it.t)}–${ts(it.end)}</time><span class="what">“${esc(it.text)}”</span><span class="sub">${esc(it.speaker || 'speaker')}${it.unbound ? ' · no visual event found for this instruction' : ''}</span>`;
+      } else {
+        const e = it.e; b.className = 'ev'; b.style.setProperty('--c', `var(${statusColor[e.grounding_status]})`);
+        const where = e.target?.text ? `on “${esc(e.target.text)}”` : e.spatial?.point_xy_px ? `at ${e.spatial.point_xy_px.join(', ')}` : 'position not observable';
+        b.innerHTML = `<time>${ts(it.t)}</time><span class="what">${esc(e.type)} ${where}</span><span class="pill" style="--c:var(${statusColor[e.grounding_status]})">${e.grounding_status}</span>
+                       <span class="sub">${e.audio_references.length ? 'bound to the spoken instruction' : 'no spoken instruction nearby'} · confidence ${e.overall_confidence.toFixed(2)}</span>`;
+      }
+      b.addEventListener('click', () => select(idx, true));
+      li.appendChild(b); ol.appendChild(li);
+    });
+    $('timelineEmpty').classList.toggle('hidden', items.length > 0);
+
+    $('json').textContent = JSON.stringify(graph, null, 2);
+    $('dlJson').href = `/api/jobs/${job}/graph.json`; $('dlDe').href = `/api/jobs/${job}/timeline.de.txt`; $('dlEn').href = `/api/jobs/${job}/timeline.en.txt`;
+    $('detail').classList.remove('hidden');
+    const first = items.findIndex(i => i.kind === 'event'); if (first >= 0) select(first, true);
+  }
+
+  function select(idx, seek) {
+    activeIdx = idx; const it = items[idx];
+    document.querySelectorAll('.ev').forEach(el => el.classList.toggle('active', +el.dataset.idx === idx));
+    if (seek && player.src) { player.currentTime = it.t; player.pause(); }
+    const e = it.kind === 'event' ? it.e : (it.eventIdx != null ? graph.events[it.eventIdx] : null);
+    if (!e) { $('descDe').textContent = `“${it.text}” — no visual event could be associated with this instruction.`; $('descDe').className = 'desc hedged'; $('descEn').textContent = ''; $('facts').innerHTML = ''; $('evidence').innerHTML = ''; draw(); return; }
+    $('descDe').textContent = e.description_de; $('descDe').className = 'desc' + (e.grounding_status === 'observed' ? '' : ' hedged');
+    $('descEn').textContent = e.description_en;
+    const f = [['Time', `${ts(e.temporal.start_s)} → ${ts(e.temporal.peak_s)} → ${ts(e.temporal.end_s)}`],
+               ['Grounding', e.grounding_status],
+               ['Point (px)', e.spatial?.point_xy_px ? e.spatial.point_xy_px.join(', ') : '—'],
+               ['Target box (px)', e.spatial?.bbox_xyxy_px ? `[${e.spatial.bbox_xyxy_px.join(', ')}]` : '—'],
+               ['Target', e.target ? `${e.target.object_id} · ${e.target.class}${e.target.text ? ` · “${e.target.text}”` : ''}` : '—'],
+               ['Spoken', e.audio_references.map(a => `“${a.transcript}” (${a.speaker_id || 'speaker'}, ${ts(a.start_s)}–${ts(a.end_s)})`).join('; ') || '—'],
+               ['Overall confidence', e.overall_confidence.toFixed(2)]];
+    $('facts').innerHTML = f.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+    $('evidence').innerHTML = e.evidence.map(x => `<li><b>${esc(x.source.replace(/_/g, ' '))}</b> ${x.confidence.toFixed(2)}<div class="bar"><i style="width:${Math.round(x.confidence * 100)}%"></i></div></li>`).join('') || '<li>none</li>';
+    draw();
+  }
+
+  // ---- overlay ----
+  function activeEvent() {
+    if (!graph) return null;
+    // Prefer the selected event when the playhead is near it; otherwise whichever event is near the playhead.
+    const t = player.currentTime;
+    const sel = activeIdx >= 0 ? items[activeIdx] : null;
+    const selE = sel && (sel.kind === 'event' ? sel.e : (sel.eventIdx != null ? graph.events[sel.eventIdx] : null));
+    if (selE && Math.abs(selE.temporal.peak_s - t) < 1.5) return selE;
+    return graph.events.find(e => t >= e.temporal.start_s - 0.4 && t <= e.temporal.end_s + 1.0) || null;
+  }
+  function draw() {
+    const w = overlay.width = overlay.clientWidth * devicePixelRatio, h = overlay.height = overlay.clientHeight * devicePixelRatio;
+    ctx.clearRect(0, 0, w, h);
+    const e = activeEvent(); if (!e || !graph.video || !player.videoWidth) return;
+    // Map source pixels → displayed video (object-fit: contain letterboxing)
+    const vw = graph.video.width_px, vh = graph.video.height_px, scale = Math.min(w / vw, h / vh);
+    const ox = (w - vw * scale) / 2, oy = (h - vh * scale) / 2, X = x => ox + x * scale, Y = y => oy + y * scale;
+    const color = getComputedStyle(document.documentElement).getPropertyValue(statusColor[e.grounding_status]).trim();
+    ctx.lineWidth = 2 * devicePixelRatio; ctx.strokeStyle = color; ctx.fillStyle = color;
+    if (e.spatial?.bbox_xyxy_px) {
+      const [x1, y1, x2, y2] = e.spatial.bbox_xyxy_px;
+      ctx.setLineDash(e.grounding_status === 'observed' ? [] : [6 * devicePixelRatio, 5 * devicePixelRatio]);
+      ctx.strokeRect(X(x1), Y(y1), (x2 - x1) * scale, (y2 - y1) * scale);
+      ctx.setLineDash([]);
+      if (e.target?.text) { ctx.font = `${13 * devicePixelRatio}px "IBM Plex Sans", system-ui`; const label = `${e.target.text}  ${ts(e.temporal.peak_s)}`; const tw = ctx.measureText(label).width + 12 * devicePixelRatio;
+        ctx.fillRect(X(x1), Y(y1) - 20 * devicePixelRatio, tw, 20 * devicePixelRatio); ctx.fillStyle = '#0f1a16'; ctx.fillText(label, X(x1) + 6 * devicePixelRatio, Y(y1) - 6 * devicePixelRatio); ctx.fillStyle = color; }
+    }
+    if (e.spatial?.point_xy_px) {
+      const [px, py] = e.spatial.point_xy_px, cx = X(px), cy = Y(py), r = 14 * devicePixelRatio;
+      ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(cx - r * 1.6, cy); ctx.lineTo(cx - r * .6, cy); ctx.moveTo(cx + r * .6, cy); ctx.lineTo(cx + r * 1.6, cy);
+      ctx.moveTo(cx, cy - r * 1.6); ctx.lineTo(cx, cy - r * .6); ctx.moveTo(cx, cy + r * .6); ctx.lineTo(cx, cy + r * 1.6); ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, 2.5 * devicePixelRatio, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  player.addEventListener('timeupdate', draw); player.addEventListener('seeked', draw); player.addEventListener('loadedmetadata', draw);
+  new ResizeObserver(draw).observe(overlay);
+  let raf; player.addEventListener('play', function loop() { draw(); if (!player.paused) raf = requestAnimationFrame(loop); });
+  player.addEventListener('pause', () => cancelAnimationFrame(raf));
+
+  function ts(s) { const m = Math.floor(s / 60), sec = s - m * 60; return `${String(m).padStart(2, '0')}:${sec.toFixed(2).padStart(5, '0')}`; }
+  function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+})();
+</script>
+</body>
+</html>

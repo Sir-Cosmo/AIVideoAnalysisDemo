@@ -1,0 +1,23 @@
+{
+  "profiles": {
+    "run (offline demo)": {
+      "commandName": "Project",
+      "commandLineArgs": "run --video samples/demo.mp4 --out samples/demo.events.json --transcript samples/demo_whisperx.json --ui-json samples/demo_ui.json",
+      "workingDirectory": "$(SolutionDir)"
+    },
+    "eval (offline demo)": {
+      "commandName": "Project",
+      "commandLineArgs": "eval --pred samples/demo.events.json --gt samples/demo_groundtruth.json",
+      "workingDirectory": "$(SolutionDir)"
+    },
+    "run (with sidecars)": {
+      "commandName": "Project",
+      "commandLineArgs": "run --video samples/demo.mp4 --out out/demo.events.json --asr-url http://127.0.0.1:8011 --ui-url http://127.0.0.1:8003 --molmo-url http://127.0.0.1:8002 --sam2-url http://127.0.0.1:8004 --lang de",
+      "workingDirectory": "$(SolutionDir)"
+    },
+    "help": {
+      "commandName": "Project",
+      "commandLineArgs": "--help"
+    }
+  }
+}

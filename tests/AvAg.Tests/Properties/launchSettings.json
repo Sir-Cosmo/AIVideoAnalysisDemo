@@ -1,0 +1,5 @@
+{
+  "profiles": {
+    "run all tests": { "commandName": "Project", "workingDirectory": "$(ProjectDir)" }
+  }
+}

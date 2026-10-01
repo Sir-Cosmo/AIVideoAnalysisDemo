@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>avag</AssemblyName>
+    <RootNamespace>AvAg.Cli</RootNamespace>
+    <StartupObject></StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AvAg.Core\AvAg.Core.csproj" />
+    <ProjectReference Include="..\AvAg.Pipeline\AvAg.Pipeline.csproj" />
+  </ItemGroup>
+</Project>

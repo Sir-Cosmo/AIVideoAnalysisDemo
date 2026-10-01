@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Console test runner (no NuGet dependency). Run via F5 / `dotnet run`. Swap for xUnit if you prefer Test Explorer. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>AvAg.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\AvAg.Core\AvAg.Core.csproj" />
+    <ProjectReference Include="..\..\src\AvAg.Pipeline\AvAg.Pipeline.csproj" />
+  </ItemGroup>
+</Project>
