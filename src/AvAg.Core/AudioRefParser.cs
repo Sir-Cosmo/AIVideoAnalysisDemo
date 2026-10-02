@@ -16,7 +16,8 @@ public sealed class AudioRefParser
     {
         (Rx(@"doppelklick\w*|double[- ]?click\w*"), ActionType.DoubleClick),
         (Rx(@"rechtsklick\w*|right[- ]?click\w*|rechte[rn]? maustaste"), ActionType.RightClick),
-        (Rx(@"klick\w*|anklick\w*|click\w*|dr[üu]ck\w*|press\w*"), ActionType.Click),
+        // "drücken" (press) only with the umlaut: "drucken/Drucker" means print/printer.
+        (Rx(@"klick\w*|anklick\w*|click\w*|dr(?:ü|ue)ck\w*|press\w*"), ActionType.Click),
         (Rx(@"zieh\w*|ziehen|drag\w*|verschieb\w*"), ActionType.Drag),
         (Rx(@"tipp\w* (auf|hier|dort|da|darauf)|antipp\w*|tap\w*|touch\w*"), ActionType.Tap),
         (Rx(@"eingeb\w*|eintipp\w*|eintrag\w*|geben sie .{0,40}\bein\b|type\w*|enter\b"), ActionType.Type),

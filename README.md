@@ -1,37 +1,64 @@
 # AI Video Analysis Demo (AvAg)
 
-AvAg turns a **screen-recording tutorial** into two things:
+**Support call recording in → wiki article out.**
 
-1. **An auditable event timeline**: what was said, where on the screen it was clicked, and how sure the system is
-   about each statement. It never claims a pixel coordinate that the video does not show.
-2. **A step-by-step manual** (Word, web page/PDF, Markdown) that explains what you have to do to repeat what the
-   presenter does. It has one screenshot per step, with the click marked where it was observed. You can also
-   request a text-only version for private videos.
+Our hotline records support calls: a customer describes a problem, a supporter fixes it, usually with screen
+sharing. AvAg takes such a recording and works out
 
-Everything runs **on your own machine**. The C# application does the deterministic work (video decoding, click
-detection, fusion, output). Speech recognition and the manual writer are local AI models, reached over
-`127.0.0.1` only.
+* **what the problem was:** the symptoms and the exact error message,
+* **why it happened:** if the call makes it clear,
+* **how it was fixed:** step by step, in the order the customer can repeat it,
 
+and writes a **wiki article in Markdown**. The next customer with the same problem can then fix it themselves.
+
+* **Normal video:** every solution step gets a screenshot from the recording, with the click marked where it was
+  observed.
+* **Private video:** the article is text only, and no frame is ever taken from the video.
+
+**AI used (configurable):**
+* **OpenAI:** `gpt-4o-transcribe-diarize` for speech recognition with customer/supporter labels, and `gpt-5.5` for
+  the article. The article model also sees frames of the supporter's screen.
+* **Local fallback:** if OpenAI is not reachable or out of credit, the program automatically uses local WhisperX
+  and Ollama. Those also work completely offline when no OpenAI key is configured.
+* **API keys:** they live in .NET user secrets or environment variables, never in the repository. A test and a
+  pre-commit hook make sure of that.
+
+```markdown
+## Problem
+Die Rechnungen können nicht mehr gespeichert werden.
+**Fehlermeldung:** `Speichern nicht möglich`
+## Ursache
+Im Profil ist kein Speicherpfad hinterlegt.
+## Lösung
+### 1. Speicherpfad hinterlegen
+Öffnen Sie die Einstellungen und wählen Sie unter Profil den Ordner Dokumente aus.
+![Bildschirm bei Schritt 1](images/step-01.jpg)
+### 2. Speichern
+Klicken Sie auf die Schaltfläche Speichern.
+…
 ```
-12,71 s: Klick bei (1489, 836) auf „Speichern“ …; zugeordnet zur Audioäußerung „Klicken Sie hier“ bei 12,22–12,58 s.
-```
+
+AvAg stands for *Audio-Visual Action Grounding*: it links what is said ("klicken Sie hier") to where and when it
+was clicked on screen. That grounding is what makes the screenshots and click markers trustworthy.
 
 ---
 
 ## Contents
 
 1. [Quick start (Windows)](#1-quick-start-windows)
-2. [How it works: the analysis pipeline](#2-how-it-works-the-analysis-pipeline)
-3. [How it works: the manual](#3-how-it-works-the-manual)
-4. [Private videos and data handling](#4-private-videos-and-data-handling)
-5. [Web app and HTTP API](#5-web-app-and-http-api)
-6. [Command line](#6-command-line)
-7. [Configuration reference](#7-configuration-reference)
-8. [Processes, ports and hardware](#8-processes-ports-and-hardware)
-9. [Project layout and tests](#9-project-layout-and-tests)
-10. [Troubleshooting](#10-troubleshooting)
-11. [Advanced: more model services, evaluation, calibration](#11-advanced-more-model-services-evaluation-calibration)
-12. [Licensing](#12-licensing)
+2. [How it works: from recording to wiki article](#2-how-it-works-from-recording-to-wiki-article)
+3. [The analysis pipeline in detail](#3-the-analysis-pipeline-in-detail)
+4. [How the article is written](#4-how-the-article-is-written)
+5. [Privacy: private videos, personal data, where data goes](#5-privacy-private-videos-personal-data-where-data-goes)
+6. [The output: Markdown for the wiki](#6-the-output-markdown-for-the-wiki)
+7. [Web app and HTTP API](#7-web-app-and-http-api)
+8. [Command line](#8-command-line)
+9. [Configuration and replaceable AI services](#9-configuration-and-replaceable-ai-services)
+10. [Processes, ports and hardware](#10-processes-ports-and-hardware)
+11. [Project layout and tests](#11-project-layout-and-tests)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Advanced: more model services, evaluation](#13-advanced-more-model-services-evaluation)
+14. [Licensing](#14-licensing)
 
 ---
 
@@ -42,10 +69,10 @@ detection, fusion, output). Speech recognition and the manual writer are local A
 | What | Why | Install |
 |---|---|---|
 | .NET 8 SDK (Visual Studio 2022 17.8+ or VS 2026) | builds and runs the C# projects | `winget install Microsoft.DotNet.SDK.8` |
-| FFmpeg ≥ 6 (`ffmpeg`, `ffprobe` on `PATH`) | decodes video, extracts audio and screenshots | `winget install Gyan.FFmpeg` (restart VS / terminal afterwards) |
+| FFmpeg ≥ 6 (`ffmpeg`, `ffprobe` on `PATH`) | decodes the video, extracts audio and screenshots | `winget install Gyan.FFmpeg` (restart VS / terminal afterwards) |
 | Python 3.11 | runs the speech-recognition service (WhisperX) | python.org or `winget install Python.Python.3.11` |
-| NVIDIA GPU with CUDA (optional) | speeds up speech recognition; without a GPU it runs on the CPU | current NVIDIA driver |
-| Ollama (optional) | local language model that writes the manual text | `winget install Ollama.Ollama` |
+| NVIDIA GPU with CUDA (optional) | faster speech recognition; without a GPU it runs on the CPU | current NVIDIA driver |
+| Ollama (recommended) | local language model that writes the article | `winget install Ollama.Ollama` |
 
 ### 1.2 Speech-recognition service (one time)
 
@@ -58,106 +85,148 @@ python -m venv .venv
 .venv\Scripts\python -m pip install whisperx fastapi "uvicorn[standard]"
 ```
 
-Tested with `torch 2.8.0+cu128` and `whisperx 3.8.6`. You don't have to start the service yourself: the web app
-starts it when it needs it (see [2.2](#22-speech-recognition-whisperx-sidecar)).
+Tested with `torch 2.8.0+cu128` and `whisperx 3.8.6`. You don't need to start the service yourself: the web app
+starts it when a job needs it.
 
-### 1.3 Manual writer (optional, one time)
+**Customer vs. supporter:** WhisperX can label the speakers (`SPEAKER_00`, `SPEAKER_01`) so the language model
+knows who says what. That needs a free Hugging Face token with access to the pyannote models: set `HF_TOKEN`
+before starting the web app. Without it, the model tells customer and supporter apart from what they say, which
+works well in practice.
+
+### 1.3 OpenAI key (recommended)
+
+Store the key **outside the repository**, in .NET user secrets (`%APPDATA%\Microsoft\UserSecrets\avag-web\secrets.json`).
+The web app reads them when it runs in Development, which is the case for F5 and `dotnet run`:
+
+```powershell
+dotnet user-secrets set "AvAg:Services:TextGenerator:ApiKey" "<your key>" --project src/AvAg.Web
+dotnet user-secrets set "AvAg:Services:Asr:ApiKey"           "<your key>" --project src/AvAg.Web
+```
+
+On a server, use environment variables instead (`AvAg__Services__TextGenerator__ApiKey`, `AvAg__Services__Asr__ApiKey`).
+The CLI reads `OPENAI_API_KEY`. Enable the key check for your commits once per clone:
+
+```powershell
+git config core.hooksPath tools/hooks     # refuses commits that contain something that looks like an API key
+```
+
+Without a key, or without credit on the account, everything still works with the local models below.
+
+### 1.4 Local article writer (fallback, one time)
 
 ```powershell
 ollama pull qwen2.5:7b
-ollama create avag-manual -f sidecars/manual-llm.Modelfile
+ollama create avag-article -f sidecars/article-llm.Modelfile
 ```
 
-`manual-llm.Modelfile` sets `num_gpu 0`, so the model runs **only on the CPU** and never competes with speech
-recognition for a small laptop GPU. Without Ollama the manual is still created, but rule-based
-(see [3.2](#32-rule-based-steps-always-available)).
+`article-llm.Modelfile` sets `num_gpu 0`, so the model runs **only on the CPU** and never competes with speech
+recognition for a small laptop GPU. Without Ollama you still get an article, written rule-based
+([4.2](#42-rule-based-draft-always-available)).
 
-### 1.4 Run
+### 1.5 Run
 
 * **Visual Studio:** open `AvAg.sln`, set **AvAg.Web** as the startup project and press **F5**. The page
   http://localhost:5080 opens.
 * **Terminal:** `dotnet run --project src/AvAg.Web`
 
-Drop a video on the page, press **Analyse video**, then **Create manual**.
+Drop the call recording on the page (tick **Private video** if needed) and press **Analyse video**. Then press
+**Create wiki article**, and download the `.zip` (Markdown + images) or copy the Markdown.
 
-### 1.5 Check the installation
+### 1.6 Check the installation
 
 ```powershell
 dotnet build
-dotnet run --project tests/AvAg.Tests     # 19 tests, incl. an end-to-end run on a synthetic screen recording
+dotnet run --project tests/AvAg.Tests     # 28 tests, incl. an end-to-end run on a synthetic screen recording
 ```
 
 ---
 
-## 2. How it works: the analysis pipeline
+## 2. How it works: from recording to wiki article
 
 ```
-video ─► FFmpeg probe (real PTS time base)
-      ├─► 16 kHz mono WAV ─► WhisperX: speech → text + word timings (+ speakers) ─► AudioRefParser: "click here" …
-      ├─► coarse gray frames (3 fps, 960 px) ─► StateChangeDetector + CursorTracker ─► click candidates
-      ├─► fine gray frames (20 fps, native) around every spoken instruction ─► better click candidates
-      ├─► (optional) PNG frames ─► OmniParser + OCR ─► UiElementRegistry (stable UI element ids, button texts)
-      └─► (optional) MolmoPoint / Qwen3-VL pointing, SAM2 tracking
-                                    ▼
-          CrossModalResolver: binds spoken instructions ↔ visual events
-                                    ▼
-          EventGraph (JSON schema 1.0, evidence, grounding_status) ─► DE/EN timeline ─► manual
+support call recording (.mp4)
+   │
+   ├─ 1. Analysis (PipelineRunner) ─────────────────────────────────────────────────────────────────────────────┐
+   │     FFmpeg: audio + frames                                                                                 │
+   │     Speech: OpenAI gpt-4o-transcribe-diarize (who said what) + local WhisperX word alignment               │
+   │             – or fully local WhisperX when OpenAI is not available                                        │
+   │     Spoken instructions ("klicken Sie auf Speichern") ↔ observed clicks on screen (cursor rests + screen    │
+   │     changes) → event graph with evidence and a grounding status per click                                  │
+   │                                                                                                            │
+   ├─ 2. Article (ArticleService) ◄──────────────────────────────────────────────────────────────────────────────┘
+   │     a) rule-based draft: problem, error message, cause, steps, verification
+   │     b) language model (gpt-5.5, fallback: local Ollama) writes the article from the whole numbered
+   │        transcript, the observed clicks and – for non-private videos – up to 12 frames of the screen; steps
+   │        point to the sentences they come from. Observed click steps the model left out are put back.
+   │        On any failure: (a).
+   │     c) personal data removed (e-mail, phone, IBAN, customer numbers, names, companies)
+   │     d) screenshots: one per step, at the observed click (red box) or at a settled, distinct frame
+   │        ── skipped entirely for private videos
+   │
+   └─ 3. Output: article.md (front matter + Markdown) + images/step-NN.jpg  →  your wiki
 ```
 
-`src/AvAg.Pipeline/PipelineRunner.cs` runs these steps in order for one video.
+The analysis and the article are separate steps. You can create the article several times (different language,
+with or without the model, private or not) without analysing the video again.
 
-### 2.1 Ingest (FFmpeg)
+---
+
+## 3. The analysis pipeline in detail
+
+`src/AvAg.Pipeline/PipelineRunner.cs` runs these steps for one video.
+
+### 3.1 Ingest (FFmpeg)
 
 `FfmpegService` reads duration, size and frame rate with `ffprobe`. It extracts the audio as 16 kHz mono WAV
-and decodes frames as grayscale bitmaps, taking the time stamps from FFmpeg's `showinfo` filter (`pts_time`) so
-variable-frame-rate recordings keep correct times. Intermediate frames and the WAV live in a temporary work
-folder that is **deleted after the run**.
+and decodes frames as grayscale bitmaps, taking the time stamps from FFmpeg (`showinfo` → `pts_time`) so
+variable-frame-rate recordings keep correct times. The WAV and frames live in a temporary work folder that is
+**deleted after the run**.
 
-### 2.2 Speech recognition (WhisperX sidecar)
+### 3.2 Speech recognition
 
-`sidecars/whisperx_server.py` is a small FastAPI service (`POST /transcribe {audio_path, language, diarize}`)
-that the C# side calls with the path of the WAV:
+**OpenAI (default)** – `Adapters/Asr/OpenAiTranscriber.cs`:
+* The audio is uploaded as compressed mono MP3 (32 kbit/s: about 14 h fit into the 25 MB limit).
+* `gpt-4o-transcribe-diarize` returns the text with **speaker labels** (`SPEAKER_A`, `SPEAKER_B`), so the article
+  model knows who is the customer and who is the supporter. It is clearly better than the local model,
+  especially for Swiss German and technical terms.
+* It gives times per segment, not per word. The local WhisperX sidecar therefore aligns the text to **exact word
+  times** (`POST /align`, configured as `AlignUrl`); these tie "klicken Sie hier" to the click on screen. If the
+  aligner isn't running, word times are spread over the segment and the log says so.
+* Alternatives: `whisper-1` gives word times itself but no speakers. `Prompt` passes product names and
+  abbreviations (not supported by the diarize model).
+* If OpenAI fails (no network, no credit, invalid key, timeout), the configured **fallback**, the local WhisperX,
+  transcribes instead. The job log says why.
 
-1. **Transcription:** faster-whisper. The model is chosen automatically: `large-v3` on GPUs with ≥ 8 GB or on the
-   CPU, `medium` on smaller GPUs.
-2. **Word alignment:** a wav2vec2 alignment model gives every word a start and end time.
-3. **Speaker separation (optional):** pyannote. It only runs if `HF_TOKEN` is set; otherwise it is skipped.
+**Local WhisperX (fallback, or the only engine without OpenAI):**
+`sidecars/whisperx_server.py` is a small FastAPI service (`POST /transcribe {audio_path, language, diarize}`):
 
-Safety on small GPUs (< 8 GB):
-* The model weights are loaded as `int8_float16` and processed in batches of 4.
-* Only **one transcription runs at a time** (a lock), and GPU memory is released after each request.
-* The model loads in the background *after* the service started, so an accidental second copy fails on the busy
-  port before it can put a second model on the GPU.
+1. **Transcription:** faster-whisper. `large-v3` on GPUs with ≥ 8 GB or on the CPU, `medium` on smaller GPUs.
+2. **Word alignment:** every word gets a start and end time. These timings tie speech to clicks.
+3. **Speakers (optional):** pyannote, when `HF_TOKEN` is set.
 
-**Auto-start:** `src/AvAg.Web/SidecarLauncher.cs` starts every configured service that names a `LocalModule`
-(here `whisperx_server:app`) with `sidecars/.venv` when the web app
-starts or when a job needs it, unless something already listens on the configured address. It never starts a
-second copy. Output goes to `sidecars/whisperx_server.log`.
+On small GPUs (< 8 GB) the weights load as `int8_float16` with batch 4, only one request runs at a time, and GPU
+memory is released after every request. That keeps a 4 GB laptop GPU from running out of memory. The speech model
+loads on the first `/transcribe`; a sidecar that only aligns OpenAI transcripts never loads it.
 
-### 2.3 Spoken instructions (AudioRefParser)
+### 3.3 Spoken instructions (AudioRefParser)
 
-`src/AvAg.Core/AudioRefParser.cs` scans the word-timed transcript (German and English) for action verbs
-(click/klicken, double-click, right-click, drag, type, select, scroll …). It also records deictic words
-("hier", "here", "this") and named targets ("auf Speichern", "„OK“"), and splits sentences such as
-"zuerst …, dann …" into ordered sub-actions. Each hit is an `AudioRef` with an exact time anchor: the end of the
-deictic word, or the end of the clause.
+`src/AvAg.Core/AudioRefParser.cs` finds instructions in German and English: click/klicken, double-click,
+right-click, drag, type, select, scroll …. It notes deictic words ("hier", "this") and named targets
+("auf Speichern"). Each hit gets an exact time anchor.
 
-### 2.4 Visual events (Vision/)
+### 3.4 Clicks on screen (Vision/)
 
-* `StateChangeDetector` compares frames block by block and reports *where* and *when* the screen changed.
-* `CursorTracker` finds the mouse pointer, either with a cursor template (`--cursor`, most accurate) or as a
-  small moving blob.
-* `ClickCandidateDetector` reports a click when the cursor **rests** and the screen **changes** at that spot
-  shortly afterwards. The cursor's own movement is ignored.
+* `StateChangeDetector` finds where and when the screen changed.
+* `CursorTracker` finds the mouse pointer.
+* `ClickCandidateDetector` reports a click when the cursor rests and the screen changes right there.
 
-A coarse pass at 3 fps covers the whole video. Around every spoken instruction, a fine pass at 20 fps and full
-resolution re-checks the window from 1.5 s before to 2.5 s after the instruction.
+A coarse pass (3 fps) covers the whole video. A fine pass (20 fps, full resolution) re-checks the window around
+every spoken instruction.
 
-### 2.5 Fusion and grounding status
+### 3.5 Fusion and grounding status
 
-`src/AvAg.Core/Fusion.cs` scores every pair (spoken instruction, visual event):
-`S = 0.35·time + 0.20·meaning + 0.15·pointer + 0.15·UI element + 0.15·screen change`, and picks the best
-compatible event in spoken order. The constants live in `FusionConfig`. Each event in the output gets a
+`src/AvAg.Core/Fusion.cs` binds spoken instructions to clicks:
+`S = 0.35·time + 0.20·meaning + 0.15·pointer + 0.15·UI element + 0.15·screen change`. Every click gets a
 `grounding_status`:
 
 | Source of the coordinate | `grounding_status` |
@@ -165,160 +234,255 @@ compatible event in spoken order. The constants live in `FusionConfig`. Each eve
 | visible cursor, telemetry, or UI change at a resting cursor | `observed` |
 | SAM2-propagated box | `tracked` |
 | AI pointing only (MolmoPoint / Qwen3-VL) | `inferred` |
-| no cursor, no telemetry, no localised change | `unobservable`: the position is **not** claimed |
-
-`EventGraphBuilder` writes the JSON (schema 1.0, see [11.3](#113-output-format)). `Describer` writes the German and
-English timeline, and only names a position where the evidence supports one.
+| no cursor, no localised change | `unobservable`: no position is claimed |
 
 ---
 
-## 3. How it works: the manual
+## 4. How the article is written
 
-`src/AvAg.Pipeline/Manuals/ManualService.cs` creates the manual from a finished analysis, in four stages.
+`src/AvAg.Pipeline/Articles/ArticleService.cs` orchestrates the steps below.
 
-### 3.1 Sentences
+### 4.1 Sentences
 
-`ManualBuilder.Sentences` splits the transcript into sentences using the word timings. Long unpunctuated
-run-ons are cut at 40 words, and only short fragments are glued back to the sentence before. Filler words
-("äh", "um", leading "so/also/okay") are removed.
+`TranscriptSentences.Split` (`src/AvAg.Core/Transcripts/`) turns the word-timed transcript into sentences, with the
+speaker label when available. Long unpunctuated run-ons are cut at 40 words, a change of speaker always starts a new
+sentence, and filler words ("äh", "um", leading "also/okay") are removed.
 
-### 3.2 Rule-based steps (always available)
+### 4.2 Rule-based draft (always available)
 
-`ManualBuilder.Build` (in `src/AvAg.Core/Manuals/ManualBuilder.cs`) works without any AI model:
+`ArticleBuilder` (`src/AvAg.Core/Articles/`) works without any AI. It is the fallback, and the evidence the model's
+article is checked against:
 
-* A sentence becomes a **step** if the parser found a pointer action in it, or if it contains an instruction verb
-  (open, go to, save, copy, press, select … / öffnen, speichern, kopieren, drücken, wählen …) and addresses the
-  viewer ("you", "Sie", "just").
-* Sentences that follow a step and are not instructions become that step's **details** (at most 3).
-* The first sentence, if it isn't an instruction, becomes the **overview**.
-* Sign-offs ("like and subscribe", "bis zum nächsten Mal" …) are dropped.
-
-### 3.3 AI-written steps (when a language model is configured)
-
-`LlmManualWriter` works with whichever language model `Services:TextGenerator` selects (default: `avag-manual` =
-Qwen2.5 7B in Ollama, CPU only). The model receives the **whole transcript as numbered
-sentences** (`[12] (00:45) Select this from rectangle to window …`). It is asked to:
-
-* write the manual for the whole video, with exactly one viewer action per step, in video order;
-* use short imperative sentences ("Klicken Sie …"), write key combinations as `Ctrl + C`, and keep program and
-  button names as spoken;
-* give each step a `section` when the video shows several ways (e.g. "Method 1: Keyboard shortcut");
-* put things that are only mentioned into `tips`;
-* list for every step the **numbers of the transcript sentences it comes from**.
-
-Those sentence numbers, not times invented by the model, put each step in the video. The answer is checked:
-it must have at least 2 steps, and at least half of them must point to real sentences. If not, or if the model
-is not reachable, the rule-based manual from 3.2 is used and the web page says so. On a laptop CPU this takes
-about 1–5 minutes, depending on the video's length.
-
-### 3.4 Screenshots and click markers
-
-For every step (`ManualBuilder.PlaceScreenshots`, `ManualScreenshotService.RefineTimesAsync`):
-
-1. **Click marker:** if an observed click belongs to an instruction spoken *inside this step*, the screenshot is
-   taken right at that click, with a red box around it (and around the UI element, if one was found). A click
-   only counts if the instruction was a click or the click visibly changed the screen. Clicks from neighbouring
-   steps are never used.
-2. **Otherwise:** FFmpeg decodes small thumbnails (2 fps, 160 px wide) of the step's own part of the video. The
-   chosen frame is **settled** (it barely changes in the next half second, so menus are fully open) and
-   **differs most** from the previous step's screenshot. Frames near the spoken instruction win ties.
-3. If every candidate looks like the previous screenshot, the step gets **no picture** instead of a repeat.
-4. Screenshots are always in video order and at least 1.5 s apart. They are extracted at up to 1280 px wide.
-
-### 3.5 Output
-
-| Format | Details |
+| Part | Rule |
 |---|---|
-| Word `.docx` | built-in Title/Heading styles (navigation pane works), embedded screenshots, key combinations in bold. Written directly as Open XML, no extra library. |
-| HTML | one self-contained file (screenshots embedded), light/dark, print → PDF, key combinations as `<kbd>` keys |
-| Markdown | text only |
+| Small talk | greetings, "danke", "auf Wiederhören", "sehr gut" … are dropped |
+| **Problem** | the first sentences before the solution that say something doesn't work ("kann nicht", "Fehlermeldung", "doesn't work" …) |
+| **Error message** | quoted text in those sentences, or what follows "Meldung:" / "error:" |
+| **Cause** | the first sentence that explains why ("das liegt daran, dass …", "because …") |
+| **Steps** | every sentence that tells the customer to do something: a recognised click, or an instruction verb (öffnen, wählen, speichern, open, select …) addressed to the customer ("Sie", "bitte", "you") |
+| Details | up to 2 explaining sentences after a step |
+| **Verification** | the last "funktioniert jetzt wieder" / "works now" after the steps |
+| Keywords | the UI elements named in the instructions |
 
-Each step shows its title, the instruction, the details, the screenshot and "Shown in the video at mm:ss".
+### 4.3 AI-written article (when a language model is configured)
+
+`LlmArticleWriter` works with whatever language model `Services:TextGenerator` selects:
+* **Default:** OpenAI `gpt-5.5` with `ReasoningEffort: medium`.
+* **Fallback:** local `avag-article` (Qwen2.5 7B in Ollama, CPU only).
+
+The model gets:
+* the **whole call as numbered sentences**, e.g. `[5] (00:33) SPEAKER_A: Öffnen Sie bitte die Einstellungen …`;
+* the **clicks observed in the video**, e.g. `[00:41] Klick bei (496, 264) – gesagt: „Klicken Sie hier auf Speichern“`;
+* for models that read images (`Vision: true`) and **non-private videos only**: up to **12 frames of the
+  supporter's screen**. They are picked where the screen changed and settled, or where a click happened. They
+  let the model name menus, tabs, buttons and error dialogs exactly, even when the supporter only says "hier".
+
+It asks for JSON with:
+
+`title`, `problem`, `error_messages` (verbatim), `cause`, `applies_to` (product/module/version), `steps`
+(one action each, imperative, with `actor`, `section` for alternative solutions, and the `sentences` it comes from),
+`verification`, `notes`, `keywords`, `resolved`.
+
+The prompt tells the model to:
+* write for a customer reading the wiki, not to retell the call;
+* describe **only the way that finally worked**, and leave out failed attempts, questions and diagnosis;
+* give menu paths in full ("Datei › Einstellungen › Profil");
+* name the element instead of saying "hier";
+* keep program, menu and button names and error messages exactly as spoken;
+* **include no personal data**;
+* mark steps only support can do (licence, server, account) as `actor: support`. They appear as *(nur durch den
+  Support)*.
+
+Checks after the answer:
+* **Anchoring:** each step's place in the video comes from its sentence numbers, not from times the model
+  invents. At least half the steps must point to real sentences.
+* **Nothing observed is lost:** a draft step with an observed click that none of the model's steps cover is
+  added back (`RestoreObservedSteps`).
+* **Gaps filled:** if the model leaves the cause, verification, error message or keywords empty, the draft's are
+  used.
+* **Unsolved calls:** if the call ended without a solution (`resolved: false`), the article says so.
+* **Model fallback:** if OpenAI fails (out of credit, offline, timeout), the configured fallback model writes the
+  article, and the log names the model that did.
+* **Draft fallback:** if every model fails or the answer is unusable, the rule-based draft is used and the page
+  shows why.
+
+### 4.4 Screenshots (not for private videos)
+
+`ArticleBuilder.PlaceScreenshots` and `ArticleScreenshotService`:
+
+1. If an observed click belongs to an instruction spoken **in this step**, the screenshot is taken at the click,
+   with a red box around the click point (and the UI element, if known). It only counts if the instruction was a
+   click or the click visibly changed the screen.
+2. Otherwise the step's own part of the video is sampled as thumbnails (2 fps, 160 px). The chosen frame is
+   *settled* (menus fully open) and *differs most* from the previous screenshot.
+3. A step whose screen looks like the previous step's gets no picture instead of a duplicate.
+4. Screenshots are in video order, ≥ 1.5 s apart, at most 1280 px wide.
 
 ---
 
-## 4. Private videos and data handling
+## 5. Privacy: private videos, personal data, where data goes
 
-### 4.1 Private (text-only) manuals
+### 5.1 Private videos
 
-Tick **Private video** when uploading, or **Private – text only** next to *Create manual* (CLI: `--private`).
-The manual is then text only: **no frame is extracted from the video** and no click position is kept. A video
-marked private at upload can never get screenshots later.
+Tick **Private video** when uploading, or **Private – text only** next to *Create wiki article* (CLI:
+`--private`). The article is then text only: **no frame is extracted from the video** and no click position is
+kept. A video marked private at upload can never get screenshots later.
 
-### 4.2 Where data goes
+### 5.2 Personal data in the article
+
+Support calls are full of personal data. Three layers keep it out of the wiki:
+
+1. **The model is told** to leave out names, companies, phone numbers, e-mail addresses, customer/licence/contract
+   numbers, addresses and passwords.
+2. **`PersonalDataRedactor`** removes whatever can be recognised by its shape and replaces it with `[entfernt]` /
+   `[removed]`. The count is shown on the page. It catches:
+   * e-mail addresses, phone numbers (Swiss and international), IBANs, AHV and card numbers;
+   * the value after "Kundennummer", "Lizenzschlüssel", "Passwort" …;
+   * names after "Herr/Frau/Mr/Ms" or "mein Name ist" / "hier ist X von …";
+   * company names ("Firma X", "X AG/GmbH").
+3. **The article is marked `status: draft`**, and the page says to review it before publishing. A redactor can't
+   recognise every name, and **screenshots of a non-private video show the screen as it was**: customer data
+   visible on screen ends up in the images. If that's a risk, use private mode.
+
+The article never mentions the video's file name, the date of the call or who called.
+
+### 5.3 Where data goes
 
 | Data | Where | How long |
 |---|---|---|
-| Uploaded video (and transcript/UI JSON if uploaded) | `%TEMP%\avag-web\<job id>\` | deleted `RetentionMinutes` (60) after the job finished, **only while the web app is running**. Uploads left over from earlier sessions stay until you delete them. |
-| Audio WAV, analysis frames | temporary work folder inside the job folder | deleted at the end of each analysis |
-| Screenshots for the manual | temp files, read into memory, then deleted | the manual exists only in memory until the job is deleted |
-| Transcript, event graph, manual | memory of the web app | until the job is deleted or the app stops |
+| Uploaded video (and transcript/UI JSON if uploaded) | `%TEMP%\avag-web\<job id>\` | deleted `RetentionMinutes` (60) after the job finished, **only while the web app is running**. Leftovers from earlier sessions stay until deleted. |
+| Audio WAV, analysis frames, screenshot temp files | temporary files | deleted at the end of each step |
+| Transcript, event graph, article | memory of the web app | until the job is deleted or the app stops |
 
-Network traffic:
-* The web app listens on `localhost:5080` only. WhisperX runs on `127.0.0.1:8011` and Ollama on
-  `127.0.0.1:11434`.
-* **No video, audio or text is sent to any external service.**
-* Internet access only happens for one-time model downloads (Hugging Face, Ollama registry), possible
-  version-check requests from those libraries, and the Google Fonts stylesheet of the demo page.
+* The web app listens on `localhost:5080` only; WhisperX runs on `127.0.0.1:8011` and Ollama on `127.0.0.1:11434`.
+* **With the default configuration, OpenAI receives:**
 
-Speakers are labelled `SPEAKER_00` etc.; there is no face or voice identification. The outputs contain the
-transcript and OCR text of clicked elements, so check whether these can contain personal data in your domain
-(GDPR / DSGVO).
+  | | Normal video | Private video |
+  |---|---|---|
+  | Audio of the call (MP3) | yes | yes |
+  | Transcript with speaker labels | yes | yes |
+  | Observed clicks (time and position) | yes | yes |
+  | Frames of the screen | up to 12 | **never** |
+  | The video file | never | never |
+
+  Check that this is allowed for your customers' data (data-processing agreement with OpenAI, data residency).
+  If it isn't, remove the OpenAI entries in `Services` and keep only the local providers. Then nothing leaves the
+  machine; Internet access only happens for one-time model downloads and the page's Google Fonts.
 
 ---
 
-## 5. Web app and HTTP API
+## 6. The output: Markdown for the wiki
+
+`ArticleRenderer.Markdown` and `ArticlePackage` (`src/AvAg.Core/Articles/`):
+
+```
+rechnungen-nicht-mehr-speichern.zip
+├── article.md
+└── images/
+    ├── step-01.jpg
+    └── step-02.jpg
+```
+
+`article.md`:
+
+```markdown
+---
+title: "Rechnungen nicht mehr speichern"
+tags: ["Rechnungen speichern", "Speicherpfad", "Einstellungen"]
+language: de
+status: draft
+resolved: true
+source: "Support-Aufzeichnung (llm:avag-article)"
+generated: 2026-10-01
+---
+
+# Rechnungen nicht mehr speichern
+
+> Automatisch aus einer Support-Aufzeichnung erstellt – bitte vor dem Veröffentlichen prüfen.
+
+## Problem
+## Ursache
+**Betrifft:** …
+## Lösung
+### 1. …            (with ### sections when there are alternative solutions, *(nur durch den Support)* where needed)
+![Bildschirm bei Schritt 1](images/step-01.jpg)
+<!-- video 00:33 -->
+## Prüfen, ob es funktioniert
+## Hinweise
+```
+
+* **Plain CommonMark plus YAML front matter.** It imports into Wiki.js, GitHub/GitLab wikis, Azure DevOps wikis,
+  Docusaurus, MkDocs, Obsidian and most others. Wikis without front matter show it as a short block at the top,
+  which you can delete.
+* **Key combinations** appear as `` `Strg` + `C` ``.
+* **`<!-- video mm:ss -->`** comments tell a reviewer where in the recording to look; wikis don't display them.
+* **Images use relative links.** Upload the `images` folder with the article. A private article is just
+  `article.md`.
+* **Language:** the article is written in the spoken language by default, or German/English on request.
+
+---
+
+## 7. Web app and HTTP API
 
 The page (`src/AvAg.Web/wwwroot/index.html`):
-1. Choose a video and, optionally, mark it **Private**. Under *Services and analysis settings* you can set the
-   spoken language (default: auto-detect), service URLs and frame rates. You can also upload a WhisperX
-   transcript JSON and/or a UI-elements JSON to skip the corresponding services.
-2. **Analyse video.** The player shows each detected click as a crosshair and the target element as a box,
-   coloured by grounding status. The right column lists instructions and events in order, and the bottom shows
-   the evidence, the raw JSON and the full transcript (`.txt` / `.srt`).
-3. **Create manual.** Choose the language (same as spoken / German / English), private or not, and whether the
-   language model writes it. A timer runs while the model works. The preview appears below, with downloads for
-   Word, the web page and Markdown.
+1. **Choose the recording** and, if needed, tick **Private video**. *Services and analysis settings* has the
+   spoken language (default auto-detect), service URLs (only changed fields are sent; an emptied field switches
+   that service off, another URL uses that sidecar there without the configured key) and frame rates. You can also upload an existing transcript instead of using speech recognition.
+2. **Analyse video.** The player shows the detected clicks; the transcript and events are listed below.
+3. **Create wiki article.** Choose the language, private or not, and whether the language model writes it. A
+   timer runs while the model works (CPU: usually under a minute for a short call, a few minutes for long
+   ones). You get:
+   * a **Preview** and **Markdown** tab;
+   * **Download for the wiki (.zip)**, **Markdown only (.md)** and **Copy Markdown**;
+   * a status line with the step and screenshot counts, removed personal data, unsolved cases and any fallback.
 
 | Method | Route | Purpose |
 |---|---|---|
-| GET | `/api/config` | default service URLs, retention, configured manual model |
-| POST | `/api/jobs` | multipart: `video` or `use_demo=true`, optional `transcript`, `ui_json`, `cursor`, `private`, `lang`, `asr_url`, `ui_url`, `molmo_url`, `sam2_url`, `qwen_url`, `coarse_fps`, `fine_fps`, `diarize` → `{id}` |
-| GET | `/api/jobs/{id}` | status, log, event graph, transcript |
-| GET | `/api/jobs/{id}/graph.json`, `/timeline.{de\|en}.txt`, `/transcript.{txt\|srt}` | results |
-| GET | `/api/jobs/{id}/video` | the uploaded video (range requests for seeking) |
-| POST | `/api/jobs/{id}/manual` | form: `lang` (`de`/`en`/empty), `llm` (`true`/`false`), `private` → creates the manual |
-| GET | `/api/jobs/{id}/manual.{docx\|html\|md}` | the manual |
-| DELETE | `/api/jobs/{id}` | deletes the job and its files immediately |
+| GET | `/api/config` | default service URLs, retention, configured article model |
+| POST | `/api/jobs` | multipart: `video` or `use_demo=true`; optional `transcript`, `ui_json`, `cursor`, `private`, `lang`, `asr_url`, `ui_url`, `molmo_url`, `sam2_url`, `qwen_url` (absent or the configured URL = as configured, empty = off, other URL = that sidecar there, no key), `coarse_fps`, `fine_fps`, `diarize` → `{id}` |
+| GET | `/api/jobs/{id}` | status, log, event graph, transcript, services used |
+| GET | `/api/jobs/{id}/graph.json`, `/timeline.{de\|en}.txt`, `/transcript.{txt\|srt}`, `/video` | analysis results |
+| POST | `/api/jobs/{id}/article` | form: `lang` (`de`/`en`/empty), `llm` (`true`/`false`), `private` → `{title, steps, screenshots, redactions, resolved, method, log}` |
+| GET | `/api/jobs/{id}/article.{md\|zip\|html}` | Markdown, wiki package, HTML preview |
+| DELETE | `/api/jobs/{id}` | delete the job and its files now |
 
 ---
 
-## 6. Command line
+## 8. Command line
 
 ```powershell
-dotnet run --project src/AvAg.Cli -- run --video tutorial.mp4 --out out/tutorial.events.json --lang auto `
-    --manual out/tutorial.docx --llm-url http://127.0.0.1:11434/v1 --llm-model avag-manual
+$env:OPENAI_API_KEY = "<your key>"     # only in this terminal session
+dotnet run --project src/AvAg.Cli -- run --video call.mp4 --out out/call.events.json --lang de `
+    --asr-provider openai --asr-align http://127.0.0.1:8011 --asr-fallback-url http://127.0.0.1:8011 `
+    --article out/call-article --llm-provider openai --llm-model gpt-5.5 --llm-vision `
+    --llm-fallback-provider ollama --llm-fallback-url http://127.0.0.1:11434/v1 --llm-fallback-model avag-article
+# → out/call-article/article.md + out/call-article/images/step-NN.jpg
 ```
+
+Fully local: leave out the `--asr-*` and use `--llm-url http://127.0.0.1:11434/v1 --llm-model avag-article`.
 
 | Option | Meaning |
 |---|---|
-| `--video`, `--out` | input video; event graph JSON (timelines `.timeline.de/.en.txt` are written next to it) |
-| `--transcript <whisperx.json>` | use an existing transcript instead of the speech service |
-| `--asr-url` | WhisperX service (default `http://127.0.0.1:8011`) |
-| `--lang de\|en\|auto` | spoken language (default `de`; `auto` = detect) |
-| `--manual <file.docx>` | also write the manual as `.docx`, `.html` and `.md` |
-| `--manual-lang de\|en` | manual language (default: spoken language) |
-| `--llm-url`, `--llm-model`, `--llm-key` | OpenAI-compatible model for the manual text |
-| `--private` | text-only manual, no screenshots |
-| `--ui-url`, `--ui-json`, `--molmo-url`, `--qwen-url`, `--sam2-url`, `--cursor` | optional services / inputs, see [11](#11-advanced-more-model-services-evaluation-calibration) |
+| `--video`, `--out` | the recording; event graph JSON (timelines `.timeline.de/.en.txt` next to it) |
+| `--lang de\|en\|auto` | spoken language (default `de`) |
+| `--article <folder>` | write the wiki article into this folder |
+| `--article-lang de\|en` | article language (default: spoken language) |
+| `--private` | text only, no screenshots |
+| `--llm-url`, `--llm-model`, `--llm-key`, `--llm-provider` | the language model that writes the article (without: rule-based). A broken configuration is reported before the analysis starts. |
+| `--llm-vision`, `--llm-effort <level>` | send screen frames to a vision model; reasoning effort |
+| `--asr-provider openai`, `--asr-model`, `--asr-align <url>`, `--asr-prompt "<terms>"` | OpenAI speech recognition, word alignment via local WhisperX, vocabulary |
+| `--<cap>-fallback-provider/-url/-model` | the service used when the first one fails |
+| `OPENAI_API_KEY` (environment) | key for every OpenAI service when no `--<cap>-key` is given |
+| `--transcript <whisperx.json>` | use an existing transcript instead of speech recognition |
+| `--<cap>-provider/-url/-model/-key` | any AI service, `<cap>` = `asr`, `ui`, `grounder`, `tracker`, `describer`, `llm` |
+| `--ui-json`, `--molmo-url`, `--qwen-url`, `--sam2-url`, `--cursor` | optional services / inputs ([13](#13-advanced-more-model-services-evaluation)) |
 | `--no-diarize`, `--coarse-fps`, `--fine-fps`, `--coarse-width`, `--keep`, `--describe` | analysis settings |
 
 Other commands: `avag eval --pred <graph.json> --gt <groundtruth.json>` and `avag timeline --graph <graph.json>`.
-Visual Studio launch profiles for AvAg.Cli: *run (offline demo)*, *eval (offline demo)*, *run (with sidecars)*, *help*.
 
 ---
 
-## 7. Configuration reference
+## 9. Configuration and replaceable AI services
 
 `src/AvAg.Web/appsettings.json`, section `AvAg`:
 
@@ -327,148 +491,171 @@ Visual Studio launch profiles for AvAg.Cli: *run (offline demo)*, *eval (offline
   "RetentionMinutes": 60,
   "AutoStartSidecars": true,
   "Services": {
-    "Asr":           { "Provider": "whisperx", "Url": "http://127.0.0.1:8011", "LocalModule": "whisperx_server:app" },
-    "UiParser":      { "Provider": "none" },
-    "Grounder":      { "Provider": "none" },
-    "Tracker":       { "Provider": "none" },
-    "ClipDescriber": { "Provider": "none" },
-    "TextGenerator": { "Provider": "openai-compatible", "Url": "http://127.0.0.1:11434/v1", "Model": "avag-manual", "ApiKey": "", "TimeoutSeconds": 900 }
+    "Asr": {
+      "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-4o-transcribe-diarize", "AlignUrl": "http://127.0.0.1:8011",
+      "Fallback": { "Provider": "whisperx", "Url": "http://127.0.0.1:8011", "LocalModule": "whisperx_server:app" }
+    },
+    "UiParser": { "Provider": "none" }, "Grounder": { "Provider": "none" }, "Tracker": { "Provider": "none" }, "ClipDescriber": { "Provider": "none" },
+    "TextGenerator": {
+      "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-5.5", "Vision": true, "ReasoningEffort": "medium", "TimeoutSeconds": 600,
+      "Fallback": { "Provider": "ollama", "Url": "http://127.0.0.1:11434/v1", "Model": "avag-article", "TimeoutSeconds": 900 }
+    }
   }
 }
 ```
 
-| Key | Meaning |
-|---|---|
-| `RetentionMinutes` | delete finished jobs after this time (default 60) |
-| `AutoStartSidecars` | start local sidecars (services with a `LocalModule` and a local `Url`) when they are not running |
-| `Services:<Capability>` | which AI implements the capability, and where it runs – see [Replaceable AI services](#71-replaceable-ai-services) |
+The API keys are **not** in this file. They come from user secrets or environment variables
+([1.3](#13-openai-key-recommended)). Fully local instead: `"Asr": { "Provider": "whisperx", "Url": "http://127.0.0.1:8011",
+"LocalModule": "whisperx_server:app" }` and `"TextGenerator": { "Provider": "ollama", "Url": "http://127.0.0.1:11434/v1",
+"Model": "avag-article" }`.
 
-Every service entry has the same fields:
+Every service has the same fields:
 
 | Field | Meaning |
 |---|---|
-| `Provider` | provider name (table below); `none` switches the capability off; empty = the capability's default provider when `Url`/`Path` is set |
-| `Url` | base URL of the service; for OpenAI-compatible endpoints include the version (`…/v1`) |
+| `Provider` | provider name (table below); `none` (any case) switches the capability off; empty = the default provider when `Url`/`Path` is set |
+| `Url` | base URL; for OpenAI-compatible endpoints including the version (`…/v1`) |
 | `Model` | model name, where the provider needs one |
-| `ApiKey` | only for hosted endpoints; sent as `Authorization: Bearer` and `api-key`. Put real keys in environment variables (`AvAg__Services__TextGenerator__ApiKey`) or user secrets, not in the file |
+| `ApiKey` | for hosted endpoints, sent as `Authorization: Bearer` by every provider. Put real keys in environment variables (`AvAg__Services__TextGenerator__ApiKey`) or user secrets, not in the file |
 | `Path` | input file for file-based providers (`whisperx-json`, `ui-json`) |
-| `TimeoutSeconds` | request timeout (default 1800) |
-| `LocalModule` | Python module the web app starts from `sidecars/` when the service is local and not running (`whisperx_server:app`) |
+| `TimeoutSeconds` | per request; empty = provider default (sidecars 30 min, language models 10 min) |
+| `LocalModule` | Python module the web app starts from `sidecars/` when the service is local and not running |
+| `Fallback` | another service entry, used when this one fails (not reachable, no credit, invalid key, timeout, unusable answer); may have its own fallback |
+| `Prompt` | speech recognition: product names and abbreviations to expect |
+| `AlignUrl` | speech recognition: local WhisperX sidecar that aligns a cloud transcript to exact word times |
+| `Vision` | text generation: the model reads images, so the article writer sends frames of the screen (never for private videos) |
+| `ReasoningEffort` | text generation with reasoning models (gpt-5, o3 …): `minimal`, `low`, `medium`, `high` |
 
-Any setting can also come from environment variables, e.g. `AvAg__Services__Asr__Url=http://gpu-host:8011`.
+Only what you write is used: a section without `LocalModule` starts nothing, and a section with only a `Url` uses
+the default provider. A capability you leave out entirely is off. The exception is speech recognition, which
+falls back to WhisperX on `127.0.0.1:8011`. Every setting can also come from environment variables, e.g.
+`AvAg__Services__Asr__Url=http://gpu-host:8011`.
 
-### 7.1 Replaceable AI services
+### Replaceable AI services
 
-The pipeline never talks to a specific AI. It only uses six small interfaces
-(`src/AvAg.Core/Abstractions/AiServices.cs`); `AiServiceFactory` (`src/AvAg.Pipeline/Services/`) picks the
-implementation by the `Provider` name in the configuration:
+The pipeline only knows six small interfaces (`src/AvAg.Core/Abstractions/AiServices.cs`). `AiServiceFactory`
+(`src/AvAg.Pipeline/Services/`) picks the implementation by `Provider` name:
 
 | Capability (config key) | Interface | Built-in providers |
 |---|---|---|
-| Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file) |
+| Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file), `openai` (`gpt-4o-transcribe-diarize`, `whisper-1`, …) |
 | UI elements + text (`UiParser`) | `IUiParser` | `omniparser` (default), `ui-json` (file) |
 | Fallback pointing (`Grounder`) | `IVideoGrounder` | `molmo` (default), `qwen-vl` |
 | Box tracking (`Tracker`) | `IObjectTracker` | `sam2` |
-| Clip narratives (`ClipDescriber`) | `IClipDescriber` | `qwen-vl` |
-| Manual writer (`TextGenerator`) | `ITextGenerator` | `openai-compatible` (aliases `ollama`, `openai`, `azure-openai`, `lm-studio`, `vllm`) |
+| Clip narratives (`ClipDescriber`) | `IClipDescriber` | `qwen-vl` (a Qwen-VL describer also serves as fallback pointing unless a grounder is configured) |
+| Article writer (`TextGenerator`) | `ITextGenerator` | `openai-compatible` (aliases `ollama`, `openai`, `azure-openai`, `lm-studio`, `vllm`) |
 
-**Switching to another AI that is already supported is configuration only.** For example, to write manuals with
-a hosted OpenAI-compatible model instead of the local one:
+**A supported AI on another server or with another model is configuration only.** For example, a cheaper OpenAI
+model, or Azure OpenAI:
 
 ```json
-"TextGenerator": { "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "<model>", "ApiKey": "" }
+"TextGenerator": { "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-5.4-mini" }
+"TextGenerator": { "Provider": "azure-openai", "Url": "https://<resource>.openai.azure.com/openai/v1", "Model": "<deployment>" }
 ```
 
-**Adding a new AI** (a vendor with its own API, a different speech recogniser, …) takes three steps, explained with
-a full example in [`docs/ADDING_AN_AI.md`](docs/ADDING_AN_AI.md):
-1. write one class that implements the capability's interface;
-2. register it with a provider name in `AiServiceFactory.CreateDefault()` (or on the factory in `AvAg.Web/Program.cs`);
-3. select that name in `appsettings.json` (or with `--<cap>-provider` on the CLI).
+Reasoning models (gpt-5…, o3/o4) automatically get `max_completion_tokens`, no temperature and the
+`ReasoningEffort`. If a server rejects a parameter, the request is repeated without it.
 
-Nothing else in the pipeline, the web app or the manual changes.
+**A new AI** takes one class implementing the interface, one registration in `AiServiceFactory.CreateDefault()`,
+and the provider name in the configuration. [`docs/ADDING_AN_AI.md`](docs/ADDING_AN_AI.md) has a complete
+example. The prompt, the checks, the redaction, the screenshots and the Markdown stay the same.
 
-WhisperX service environment variables: `AVAG_WHISPER_MODEL` (e.g. `large-v3`, `medium`, `small`),
-`AVAG_WHISPER_DEVICE` (`cuda`/`cpu`), `AVAG_WHISPER_COMPUTE` (`float16`/`int8_float16`/`int8`),
-`AVAG_WHISPER_BATCH`, `HF_TOKEN` (enables speaker separation).
-
-Manual model: `sidecars/manual-llm.Modelfile` (`FROM qwen2.5:7b`, `num_gpu 0`, `num_ctx 12288`,
-`temperature 0.2`). After changing it, run `ollama create avag-manual -f sidecars/manual-llm.Modelfile` again.
+WhisperX environment variables: `AVAG_WHISPER_MODEL` (`large-v3`, `medium`, `small` …), `AVAG_WHISPER_DEVICE`
+(`cuda`/`cpu`), `AVAG_WHISPER_COMPUTE`, `AVAG_WHISPER_BATCH`, `HF_TOKEN` (speaker labels).
+Article model: `sidecars/article-llm.Modelfile` (`FROM qwen2.5:7b`, `num_gpu 0`, `num_ctx 12288`); after changing
+it run `ollama create avag-article -f sidecars/article-llm.Modelfile` again.
 
 ---
 
-## 8. Processes, ports and hardware
+## 10. Processes, ports and hardware
 
 | Process | Port | Started by | Uses |
 |---|---|---|---|
+| OpenAI API | – (HTTPS) | per request | speech recognition and article (when configured and credited) |
 | AvAg.Web | 5080 (localhost) | Visual Studio / `dotnet run` | CPU, RAM for frames during analysis |
-| WhisperX (`sidecars/whisperx_server.py`) | 8011 | AvAg.Web automatically, or manually | GPU (≈1 GB idle, ≈3 GB while transcribing with `medium`) or CPU |
-| Ollama (`avag-manual`) | 11434 | Windows autostart of Ollama | CPU only, ≈5.5 GB RAM while loaded (unloads after 5 idle minutes) |
+| WhisperX (`sidecars/whisperx_server.py`) | 8011 | AvAg.Web, when a job needs it | word alignment for OpenAI transcripts (small), or full speech recognition as fallback (GPU ≈3 GB with `medium`, or CPU) |
+| Ollama (`avag-article`) | 11434 | Windows autostart of Ollama | CPU only, ≈5.5 GB RAM while loaded (unloads after 5 idle minutes) |
 | FFmpeg | – | short-lived, per step | CPU |
 
 The WhisperX port is **8011**, not 8001, because some headset drivers (e.g. Sennheiser/Mitel `secomsdk.exe`)
-occupy 127.0.0.1:8001.
+occupy 127.0.0.1:8001. The web app starts without waiting for sidecars; a job waits for the services it needs
+and restarts them if they stopped.
 
-Tested on a laptop with a 4 GB NVIDIA RTX 500 Ada GPU and 64 GB RAM. For a 2-minute 1080p video: analysis
-≈ 1–2 min, AI-written manual ≈ 2–3 min.
+Tested on a laptop with a 4 GB NVIDIA RTX 500 Ada GPU and 64 GB RAM: a 1-minute call is analysed in seconds,
+and the AI-written article takes about 30–60 s. A 2-minute 1080p screen recording takes about 1–2 min to
+analyse and 2–3 min for the article.
 
 ---
 
-## 9. Project layout and tests
+## 11. Project layout and tests
 
 ```
 src/AvAg.Core                      pure logic, no I/O
-  Abstractions/AiServices.cs       the replaceable AI interfaces (IAsrService, ITextGenerator, IManualWriter, …)
+  Abstractions/AiServices.cs       the replaceable AI interfaces (IAsrService, ITextGenerator, IArticleWriter, …)
+  Transcripts/                     TranscriptSentences (sentences with speakers, clean-up)
+  Articles/                        WikiArticle (model), ArticleBuilder (rule-based draft + screenshot planning),
+                                   PersonalDataRedactor, ArticleRenderer (Markdown, HTML preview), ArticlePackage (zip/folder)
   Models.cs, AudioRefParser.cs, UiElementRegistry.cs, Fusion.cs, Describer.cs, Metrics.cs
-  Manuals/                         Manual model, ManualBuilder (rule-based steps, screenshot planning),
-                                   ManualRenderer (HTML, Markdown), ManualDocx (Word)
 src/AvAg.Pipeline                  everything that touches files, processes or the network
   PipelineRunner.cs                the analysis, step by step
   Media/, Vision/                  FFmpeg, frame differencing, cursor tracking, click detection
-  Adapters/<capability>/           one file per AI implementation (WhisperX, OmniParser, Molmo, SAM2, Qwen-VL,
-                                   OpenAI-compatible text generation) + HttpServiceClient base
-  Services/                        AiServicesOptions (configuration) + AiServiceFactory (provider registry)
-  Manuals/                         ManualService (orchestration), LlmManualWriter (prompt + answer parsing),
-                                   ManualScreenshotService (frame choice + extraction)
+  Adapters/<capability>/           one file per AI implementation + HttpServiceClient (shared client, keys, timeouts)
+  Services/                        AiServicesOptions (configuration, overrides) + AiServiceFactory (provider registry)
+  Articles/                        ArticleService (orchestration, fallback), LlmArticleWriter (prompt + answer parsing),
+                                   ArticleScreenshotService (frame choice + extraction)
 src/AvAg.Cli                       `avag run | eval | timeline`
-src/AvAg.Web                       Program.cs (wiring only), Endpoints/ (jobs, manual), JobRunner, Jobs (store,
-                                   settings, clean-up), SidecarLauncher, wwwroot/index.html
-tests/AvAg.Tests                   NuGet-free test runner (19 tests)
-sidecars/                          whisperx_server.py, manual-llm.Modelfile, optional molmo/omniparser/sam2 servers
+src/AvAg.Web                       Program.cs (wiring), Endpoints/ (jobs, article), JobRunner, Jobs, SidecarLauncher,
+                                   wwwroot/index.html
+tests/AvAg.Tests                   NuGet-free test runner (28 tests)
+tools/hooks/pre-commit             refuses commits containing API keys (git config core.hooksPath tools/hooks)
+sidecars/                          whisperx_server.py, article-llm.Modelfile, optional molmo/omniparser/sam2 servers
 deploy/                            docker-compose.yml for a Linux GPU host
 samples/                           synthetic demo video, transcript, UI elements, ground truth
 docs/                              ADDING_AN_AI.md, ROADMAP.md
 ```
 
-Dependencies point one way: `Web`/`Cli` → `Pipeline` → `Core`. Core has no knowledge of any model, file or
-service, so it can be tested and reused on its own.
+Dependencies point one way: `Web`/`Cli` → `Pipeline` → `Core`. Core knows no model, file or service.
 
-`dotnet run --project tests/AvAg.Tests` runs all tests. The end-to-end test synthesises a 640×360 recording
-where the cursor clicks a „Speichern“ button, and checks that the click is found at 12.70 ± 0.12 s, inside the
-button, and bound to the spoken instruction. The manual tests cover step extraction, click markers, sections,
-key combinations, Word output, and that a private manual never reads a frame from the video. The service tests
-check provider selection by name, that a new AI can be registered, that the language-model writer ties every step
-to real transcript sentences (using a fake model, no network), and that a failing model falls back to the
-rule-based manual.
+`dotnet run --project tests/AvAg.Tests` runs all tests (no network, no GPU):
+* **Analysis:** parser, fusion, metrics, vision, and an end-to-end run on a synthetic FFmpeg recording.
+* **Article:** a German support call yields the problem, error message, steps, click marker and verification,
+  with small talk dropped. Markdown front matter, sections, support-only steps, the zip layout and key
+  combinations are checked.
+* **Privacy:** a private article never touches the video and contains no names. The redactor removes e-mail,
+  phone, IBAN, customer numbers, names and companies, and leaves ordinary text alone.
+* **Services:** providers are resolved by name (case-insensitive "none", defaults, aliases), a new AI can be
+  registered, and a misconfiguration is reported instead of thrown. One set of override rules covers the web page
+  and the CLI, and sidecar JSON is read as snake_case.
+* **Model handling:** the language-model writer ties steps to transcript sentences (fake model). Observed steps
+  the model drops are restored, and every kind of model failure falls back to the draft.
+* **OpenAI, against fake HTTP answers in the documented formats:** the transcription request (diarized MP3,
+  bearer key); diarized and word-timestamp answers; gpt-5 parameters; images; the retry when a parameter is
+  rejected; "no credit" errors.
+* **Fallbacks:** OpenAI → local switching, and no images for a text-only fallback model.
+* **No API keys:** every file git would commit is scanned for API keys.
 
 ---
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 | Symptom | Cause / fix |
 |---|---|
-| "A model service could not be reached (… 127.0.0.1:8011)" | The WhisperX service is not running and could not be started: check that `sidecars/.venv` exists ([1.2](#12-speech-recognition-service-one-time)) and read `sidecars/whisperx_server.log`. Or upload a transcript JSON. |
-| English video transcribed as German | Set the spoken language to **Auto-detect** (the default) or `--lang auto`. |
-| "GPU out of memory" / laptop freezes during transcription | Set `AVAG_WHISPER_BATCH=1`, a smaller model (`AVAG_WHISPER_MODEL=small`) or `AVAG_WHISPER_DEVICE=cpu`. Never run two copies of the service. |
-| Manual says "kept the rule-based manual" | Ollama is not running, or the model answer was unusable. Check `ollama list` (needs `avag-manual`) and http://127.0.0.1:11434. |
-| Manual takes very long | The model runs on the CPU on purpose. Use a smaller model in the Modelfile (e.g. `qwen2.5:3b`, faster but noticeably worse) or point `Services:TextGenerator` to a faster endpoint. |
+| "A model service could not be reached (… 127.0.0.1:8011)" | WhisperX is not running and could not be started: check `sidecars/.venv` ([1.2](#12-speech-recognition-service-one-time)) and `sidecars/whisperx_server.log`, or upload a transcript JSON. |
+| Wrong language in the transcript | Set the spoken language explicitly (`de`) or to Auto-detect. Swiss German is transcribed as standard German. |
+| "GPU out of memory" / laptop freezes | `AVAG_WHISPER_BATCH=1`, `AVAG_WHISPER_MODEL=small` or `AVAG_WHISPER_DEVICE=cpu`. Never run two copies of the service. |
+| Log says "openai not usable (… HTTP 429: You have no credits remaining …) – used whisperx" | The OpenAI account has no credit; the local fallback did the work. Add credit at platform.openai.com → Billing. |
+| "HTTP 401" / "needs an API key" | Key missing or wrong: `dotnet user-secrets list --project src/AvAg.Web` (web, Development) or `OPENAI_API_KEY` (CLI). |
+| "word alignment not available – word times estimated" | The local WhisperX sidecar wasn't running for `/align`. The article still works; click matching is less precise. |
+| Article says "rule-based article" / "kept the rule-based article" | The reason is in the status line: no model reachable (OpenAI without credit and Ollama not running – `ollama list` needs `avag-article`), a typo in `Services:TextGenerator`, a timeout, or an unusable answer. |
+| Article is too thin / misses a step | The rule-based draft only knows typical phrasings; the model writes better articles. Steps with an observed click are never lost. Long calls with many detours benefit from a larger model. |
+| Personal data still in the article | The redactor only finds what has a recognisable shape. Review drafts (`status: draft`), and use private mode when the screen shows customer data. |
 | Build error "file is locked by AvAg.Web" | Stop the running web app (Visual Studio: Stop debugging) and build again. |
-| `torchcodec` warnings in the WhisperX log | Harmless: audio is passed to pyannote as an in-memory waveform. |
 
 ---
 
-## 11. Advanced: more model services, evaluation, calibration
+## 13. Advanced: more model services, evaluation
 
-### 11.1 Optional model services (Linux GPU host recommended)
+### 13.1 Optional model services (Linux GPU host recommended)
 
 ```bash
 cd sidecars
@@ -478,16 +665,14 @@ uvicorn sam2_server:app       --port 8004 &   # box tracking: SAM2_CFG / SAM2_CK
 vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8005 --allowed-local-media-path /data/videos
 ```
 
-Or all at once with `cd deploy && HF_TOKEN=... docker compose up -d`. Full requirements:
-`sidecars/requirements.txt`. With OmniParser the events name the clicked button („Speichern“), and manual
-screenshots get a box around the element.
+Or all at once with `cd deploy && HF_TOKEN=... docker compose up -d`. With OmniParser the clicked button is named
+in the events ("Speichern"), and screenshots get a box around the element.
 
-### 11.2 Cursor template
+### 13.2 Cursor template
 
-`--cursor` is a tight PNG crop of the recorded mouse pointer (hot-spot at the top-left). Without it the tracker
-uses moving-blob detection, which works on clean recordings and less well on heavily compressed video.
+`--cursor` is a tight PNG crop of the recorded mouse pointer. Without it the tracker uses moving-blob detection.
 
-### 11.3 Output format
+### 13.3 Event graph format
 
 ```jsonc
 {
@@ -506,24 +691,22 @@ uses moving-blob detection, which works on clean recordings and less well on hea
 }
 ```
 
-### 11.4 Evaluation and calibration
+### 13.4 Evaluation and calibration
 
-Annotate videos in the format of `samples/demo_groundtruth.json`, then run
-`avag eval --pred out/x.json --gt gt/x.json --tol 0.25`. It reports AVAGA@250ms (speaker ∧ phrase ∧ action ∧
-|Δt| ≤ 250 ms ∧ point ∈ target), phrase recall, action accuracy, time success, point-hit accuracy, pixel distances
-and factual event precision. The fusion constants (`FusionConfig`) and detector thresholds (`StateChangeDetector`,
-`CursorTracker`, `ClickCandidateDetector`) are starting values; tune them against AVAGA on your own videos.
-See `docs/ROADMAP.md` for the phased plan.
+Annotate videos in the format of `samples/demo_groundtruth.json` and run `avag eval --pred out/x.json --gt gt/x.json`.
+It reports AVAGA@250ms (speaker ∧ phrase ∧ action ∧ |Δt| ≤ 250 ms ∧ point ∈ target), phrase recall, action
+accuracy, time success, point-hit accuracy, pixel distances and factual event precision. `FusionConfig` and the
+detector thresholds are starting values to tune on your own recordings. See `docs/ROADMAP.md`.
 
 ---
 
-## 12. Licensing
+## 14. Licensing
 
 This repository: Apache-2.0 (`LICENSE`). Check the licence of each model before commercial use:
 
 | Component | Licence |
 |---|---|
 | WhisperX | BSD-2-Clause; faster-whisper MIT; pyannote models have their own terms |
-| Qwen2.5 (manual writer), Qwen3-VL, Molmo2, SAM2, PaddleOCR | Apache-2.0 (check datasets/checkpoints) |
+| Qwen2.5 (article writer), Qwen3-VL, Molmo2, SAM2, PaddleOCR | Apache-2.0 (check datasets/checkpoints) |
 | Ollama | MIT |
 | OmniParser | repo CC-BY-4.0; current detector weights MIT, older Ultralytics weights AGPL – **check** |

@@ -7,13 +7,15 @@ namespace AvAg.Web;
 
 /// <summary>
 /// Starts local Python sidecars (e.g. sidecars/whisperx_server.py) on demand, so F5 in Visual Studio is enough for a
-/// full run. A service is started when its options name a <see cref="ServiceOptions.LocalModule"/>, its Url points at
-/// this machine, and nothing listens there yet – never a second copy, because every instance loads its own model onto
-/// the GPU. Uses sidecars/.venv if present (python on PATH otherwise); output goes to sidecars/&lt;module&gt;.log and
-/// the processes stop with the web app. Disable with "AvAg:AutoStartSidecars": false.
+/// full run. A service is managed when its options name a <see cref="ServiceOptions.LocalModule"/>, it is not switched
+/// off, and its Url points at this machine. It is started when nothing listens there yet – never a second copy, because
+/// every instance loads its own model onto the GPU. Uses sidecars/.venv if present (python on PATH otherwise); output
+/// goes to sidecars/&lt;module&gt;.log and the processes stop with the web app. Disable with "AvAg:AutoStartSidecars": false.
 /// </summary>
 public sealed class SidecarLauncher : IHostedService, IDisposable
 {
+    private static readonly TimeSpan ReadyTimeout = TimeSpan.FromMinutes(10); // a first start may download the model
+
     private readonly WebSettings _settings;
     private readonly ILogger<SidecarLauncher> _log;
     private readonly string _contentRoot;
@@ -25,51 +27,58 @@ public sealed class SidecarLauncher : IHostedService, IDisposable
         _settings = settings; _log = log; _contentRoot = env.ContentRootPath;
     }
 
-    /// <summary>At start-up: every configured service with a local module.</summary>
+    /// <summary>At start-up: launch every managed sidecar that is not running. Does not wait for them – the web app is
+    /// usable immediately, and a job waits for the services it needs (<see cref="EnsureReadyAsync"/>).</summary>
     public async Task StartAsync(CancellationToken ct)
     {
-        var s = _settings.Services;
-        foreach (var o in new[] { s.Asr, s.UiParser, s.Grounder, s.Tracker, s.ClipDescriber, s.TextGenerator })
-            await EnsureStartedAsync(o, ct);
+        foreach (var o in _settings.Services.All)
+            if (IsManaged(o, out var uri)) await StartIfNeededAsync(o, uri, ct);
     }
 
-    /// <summary>Before a job: (re)starts the service if needed and waits until it accepts connections.</summary>
-    public async Task EnsureReadyAsync(ServiceOptions o, Action<string> progress, CancellationToken ct)
+    /// <summary>
+    /// Before a job: (re)starts every managed sidecar the job uses and waits until each configured (primary) service
+    /// accepts connections. Fallback sidecars are only started, never waited for: a broken or slowly loading fallback
+    /// must not hold up or fail a job whose primary service works – if the fallback is needed, its own error is reported.
+    /// </summary>
+    public async Task EnsureReadyAsync(AiServicesOptions services, Action<string> progress, CancellationToken ct)
     {
-        if (!IsManaged(o, out var uri) || await IsListeningAsync(uri, ct)) return;
-        progress($"starting the {o.LocalModule} sidecar…");
-        await EnsureStartedAsync(o, ct);
-        if (!_byPort.TryGetValue(uri.Port, out var p)) return;
-        var deadline = DateTime.UtcNow.AddMinutes(10); // a first start may download the model
-        while (DateTime.UtcNow < deadline && !p.HasExited)
+        foreach (var primary in services.Primaries)
+        foreach (var o in primary.WithFallbacks())
         {
-            if (await IsListeningAsync(uri, ct)) return;
-            await Task.Delay(1000, ct);
+            if (!IsManaged(o, out var uri) || await IsListeningAsync(uri, ct)) continue;
+            bool isFallback = !ReferenceEquals(o, primary);
+            progress(isFallback ? $"starting the {o.LocalModule} sidecar (fallback) in the background…" : $"starting the {o.LocalModule} sidecar…");
+            await StartIfNeededAsync(o, uri, ct);
+            if (isFallback || !_byPort.TryGetValue(uri.Port, out var p)) continue; // could not be started – the job reports the connection error
+            var deadline = DateTime.UtcNow + ReadyTimeout;
+            while (!await IsListeningAsync(uri, ct))
+            {
+                if (p.HasExited) throw new InvalidOperationException($"The {o.LocalModule} sidecar exited (code {p.ExitCode}); see {LogName(o)} in the sidecars folder.");
+                if (DateTime.UtcNow > deadline) throw new TimeoutException($"The {o.LocalModule} sidecar did not start within {ReadyTimeout.TotalMinutes:0} min.");
+                await Task.Delay(1000, ct);
+            }
         }
-        if (p.HasExited) throw new InvalidOperationException($"The {o.LocalModule} sidecar exited (code {p.ExitCode}); see {LogName(o)} in the sidecars folder.");
     }
 
     private bool IsManaged(ServiceOptions o, out Uri uri)
     {
         uri = null!;
-        if (!_settings.AutoStartSidecars || string.IsNullOrWhiteSpace(o.LocalModule) || o.Provider == ServiceOptions.None) return false;
+        if (!_settings.AutoStartSidecars || string.IsNullOrWhiteSpace(o.LocalModule) || o.IsOff) return false;
         if (!Uri.TryCreate(o.Url, UriKind.Absolute, out var u) || u.Host is not ("127.0.0.1" or "localhost")) return false;
         uri = u;
         return true;
     }
 
-    private async Task EnsureStartedAsync(ServiceOptions o, CancellationToken ct)
+    /// <summary>Starts the process unless something listens on the port or our own copy is still starting. The lock only
+    /// covers this check-and-start, never the wait for readiness.</summary>
+    private async Task StartIfNeededAsync(ServiceOptions o, Uri uri, CancellationToken ct)
     {
-        if (!IsManaged(o, out var uri)) return;
         await _startLock.WaitAsync(ct);
         try
         {
+            if (_byPort.TryGetValue(uri.Port, out var running) && !running.HasExited) return;
             if (await IsListeningAsync(uri, ct)) return;
-            if (_byPort.TryGetValue(uri.Port, out var running) && !running.HasExited) return; // ours, still starting
             Start(o, uri);
-            // The sidecar binds its port first and loads the model in the background.
-            if (_byPort.TryGetValue(uri.Port, out var p))
-                for (int i = 0; i < 60 && !p.HasExited && !await IsListeningAsync(uri, ct); i++) await Task.Delay(500, ct);
         }
         finally { _startLock.Release(); }
     }

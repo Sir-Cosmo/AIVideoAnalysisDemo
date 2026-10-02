@@ -67,11 +67,11 @@ public static class WhisperXMapper
 /// <summary>Provider "whisperx": sidecars/whisperx_server.py — POST /transcribe {audio_path, language, diarize} → WhisperX JSON.</summary>
 public sealed class WhisperXSidecar : HttpServiceClient, IAsrService
 {
-    public WhisperXSidecar(string baseUrl, HttpClient? http = null, TimeSpan? timeout = null) : base(baseUrl, http, timeout) { }
+    public WhisperXSidecar(string baseUrl, string? apiKey = null, TimeSpan? timeout = null) : base(baseUrl, apiKey, timeout) { }
 
     public async Task<Transcript> TranscribeAsync(string audioWavPath, string? languageHint, bool diarize, CancellationToken ct = default)
     {
-        var wx = await PostAsync<object, WhisperXJson>("transcribe", new { audio_path = Path.GetFullPath(audioWavPath), language = languageHint, diarize }, ct);
+        var wx = await PostAsync<WhisperXJson>("transcribe", new { audio_path = Path.GetFullPath(audioWavPath), language = languageHint, diarize }, ct);
         return WhisperXMapper.ToTranscript(wx);
     }
 }

@@ -1,0 +1,13 @@
+#!/bin/sh
+# Refuses a commit whose added lines contain something that looks like an API key or a filled-in "ApiKey" setting.
+# Enable once per clone:  git config core.hooksPath tools/hooks
+# Keys belong in user secrets / environment variables, never in the repository (see README, "Configuration").
+pattern='(sk-(proj-|live-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}|"ApiKey"[[:space:]]*:[[:space:]]*"[^"]+"|AIza[0-9A-Za-z_-]{30,}|xox[abp]-[0-9A-Za-z-]{10,})'
+hits=$(git diff --cached -U0 --no-color | grep -E '^\+[^+]' | grep -E "$pattern")
+if [ -n "$hits" ]; then
+  echo "pre-commit: commit refused – the staged changes contain what looks like an API key:" >&2
+  echo "$hits" | sed -E 's/(sk-[A-Za-z0-9_-]{4})[A-Za-z0-9_-]+/\1…/g; s/("ApiKey"[[:space:]]*:[[:space:]]*")[^"]+/\1…/g' >&2
+  echo "Move it to user secrets (dotnet user-secrets set ...) or an environment variable." >&2
+  exit 1
+fi
+exit 0

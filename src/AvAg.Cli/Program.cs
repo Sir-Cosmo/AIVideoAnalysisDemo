@@ -1,7 +1,7 @@
 using System.Globalization;
 using AvAg.Core;
 using AvAg.Pipeline;
-using AvAg.Pipeline.Manuals;
+using AvAg.Pipeline.Articles;
 using AvAg.Pipeline.Services;
 
 CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
@@ -28,7 +28,7 @@ catch (Exception ex)
 static void Usage()
 {
     Console.WriteLine("""
-    avag — Audio-Visual Action Grounding pipeline (C#)
+    avag — support call recording → wiki article (Audio-Visual Action Grounding)
 
     avag run --video <file.mp4> --out <graph.json> [options]
         --lang <de|en|auto>            spoken language (default de; auto = detect)
@@ -40,8 +40,12 @@ static void Usage()
 
       AI services – every capability can use any registered provider:
         --<cap>-provider <name>  --<cap>-url <url>  --<cap>-model <name>  --<cap>-key <key>
+        --<cap>-fallback-provider/-url/-model   used when the service fails (e.g. OpenAI → local)
         with <cap> = asr | ui | grounder | tracker | describer | llm   (provider "none" switches it off)
-        Built-in providers: asr: whisperx (default, http://127.0.0.1:8011), whisperx-json
+        --asr-prompt "<vocabulary>"  --asr-align <url of local WhisperX for word times>
+        --llm-vision (send screen images)  --llm-effort minimal|low|medium|high
+        OpenAI: --asr-provider openai / --llm-provider openai; the key comes from --<cap>-key or OPENAI_API_KEY
+        Built-in providers: asr: whisperx (default, http://127.0.0.1:8011), whisperx-json, openai
                             ui: omniparser, ui-json        grounder: molmo, qwen-vl
                             tracker: sam2                  describer: qwen-vl
                             llm: openai-compatible (aliases ollama, openai, azure-openai, lm-studio, vllm)
@@ -50,12 +54,12 @@ static void Usage()
         --ui-json <elements.json>      = --ui-provider ui-json
         --molmo-url <url>  --sam2-url <url>  --qwen-url <url> (Qwen3-VL for narratives and fallback pointing)
 
-      Manual:
-        --manual <manual.docx>         also write a step-by-step manual: .docx, .html and .md next to each other
-        --manual-lang <de|en>          manual language (default: spoken language)
-        --private                      private video: manual is text only, no screenshots
+      Wiki article:
+        --article <folder>             write the wiki article: <folder>/article.md + <folder>/images/step-NN.jpg
+        --article-lang <de|en>         article language (default: spoken language)
+        --private                      private video: text only, no screenshots are taken
         --llm-url <url/v1> --llm-model <name> [--llm-key <key>]
-                                       language model that writes the manual (default: rule-based)
+                                       language model that writes the article (default: rule-based)
 
     avag eval --pred <graph.json> --gt <groundtruth.json> [--tol 0.25]
     avag timeline --graph <graph.json> [--lang de|en]
@@ -76,29 +80,37 @@ static Dictionary<string, string> ParseOptions(IEnumerable<string> args)
     return d;
 }
 
-/// <summary>CLI flags → the same service configuration the web app reads from appsettings.json.</summary>
+/// <summary>CLI flags → the same service configuration the web app reads from appsettings.json.
+/// The shortcuts go through <see cref="AiServicesOptions.WithOverrides"/>, the same rules the web page uses.</summary>
 static AiServicesOptions ServicesFrom(Dictionary<string, string> o)
 {
-    var s = new AiServicesOptions();
-    if (o.TryGetValue("transcript", out var tr)) s.Asr = ServiceOptions.FromFile("whisperx-json", tr);
-    if (o.TryGetValue("ui-json", out var uj)) s.UiParser = ServiceOptions.FromFile("ui-json", uj);
-    if (o.TryGetValue("molmo-url", out var mu)) s.Grounder = new() { Provider = "molmo", Url = mu };
-    if (o.TryGetValue("sam2-url", out var su)) s.Tracker = new() { Provider = "sam2", Url = su };
-    if (o.TryGetValue("qwen-url", out var qu))
+    var s = new AiServicesOptions
     {
-        s.ClipDescriber = new() { Provider = "qwen-vl", Url = qu };
-        if (!o.ContainsKey("molmo-url")) s.Grounder = new() { Provider = "qwen-vl", Url = qu };
-    }
-    Apply(s.Asr, "asr"); Apply(s.UiParser, "ui"); Apply(s.Grounder, "grounder");
-    Apply(s.Tracker, "tracker"); Apply(s.ClipDescriber, "describer"); Apply(s.TextGenerator, "llm");
-    return s;
+        Asr = Apply(new(), "asr"), UiParser = Apply(new(), "ui"), Grounder = Apply(new(), "grounder"),
+        Tracker = Apply(new(), "tracker"), ClipDescriber = Apply(new(), "describer"), TextGenerator = Apply(new(), "llm"),
+    };
+    return s.WithOverrides(new ServiceOverrides(
+        GrounderUrl: o.GetValueOrDefault("molmo-url"), TrackerUrl: o.GetValueOrDefault("sam2-url"), ClipDescriberUrl: o.GetValueOrDefault("qwen-url"),
+        TranscriptFile: o.GetValueOrDefault("transcript"), UiElementsFile: o.GetValueOrDefault("ui-json")));
 
-    void Apply(ServiceOptions so, string cap)
+    ServiceOptions Apply(ServiceOptions so, string cap)
     {
-        if (o.TryGetValue($"{cap}-url", out var url)) { so.Url = url; if (so.Provider == ServiceOptions.None) so.Provider = null; }
+        if (o.TryGetValue($"{cap}-url", out var url)) so = string.IsNullOrWhiteSpace(url) ? ServiceOptions.Off() : new ServiceOptions { Url = url.Trim() };
         if (o.TryGetValue($"{cap}-provider", out var p)) so.Provider = p;
         if (o.TryGetValue($"{cap}-model", out var m)) so.Model = m;
         if (o.TryGetValue($"{cap}-key", out var k)) so.ApiKey = k;
+        if (o.TryGetValue($"{cap}-prompt", out var pr)) so.Prompt = pr;
+        if (o.TryGetValue($"{cap}-align", out var al)) so.AlignUrl = al;
+        if (o.TryGetValue($"{cap}-effort", out var ef)) so.ReasoningEffort = ef;
+        if (o.ContainsKey($"{cap}-vision")) so.Vision = true;
+        if (o.TryGetValue($"{cap}-fallback-url", out var fu))
+            so.Fallback = new ServiceOptions { Provider = o.GetValueOrDefault($"{cap}-fallback-provider"), Url = fu, Model = o.GetValueOrDefault($"{cap}-fallback-model") };
+        // Keys never on the command line in scripts: OpenAI's key also comes from the OPENAI_API_KEY environment variable.
+        if (so.ApiKey is null && (so.Url?.Contains("api.openai.com", StringComparison.OrdinalIgnoreCase) == true
+                                  || string.Equals(so.Provider, "openai", StringComparison.OrdinalIgnoreCase)))
+            so.ApiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (so.Url is null && string.Equals(so.Provider, "openai", StringComparison.OrdinalIgnoreCase)) so.Url = "https://api.openai.com/v1";
+        return so;
     }
 }
 
@@ -109,6 +121,12 @@ static async Task<int> RunAsync(Dictionary<string, string> o)
     var factory = AiServiceFactory.CreateDefault();
     var services = ServicesFrom(o);
     var pipelineServices = factory.CreatePipelineServices(services);
+
+    // Check the article writer before the (long) analysis: a configuration error is reported now and the
+    // rule-based article is written later instead of losing the run.
+    string? writerProblem = null;
+    var writer = o.ContainsKey("article") ? factory.TryCreateArticleWriter(services, out writerProblem) : null;
+    if (writerProblem is not null) Console.Error.WriteLine($"warning: language model not usable ({writerProblem}) – the article will be rule-based");
 
     var cfg = new PipelineConfig
     {
@@ -128,16 +146,13 @@ static async Task<int> RunAsync(Dictionary<string, string> o)
     Console.WriteLine(result.TimelineDe);
     Console.Error.WriteLine($"wrote {outPath}");
 
-    if (o.TryGetValue("manual", out var manualPath))
+    if (o.TryGetValue("article", out var folder))
     {
-        var svc = new ManualService(factory.CreateManualWriter(services));
-        var manual = await svc.CreateAsync(result, video, Path.GetFileName(video),
-            new ManualRequest(o.GetValueOrDefault("manual-lang"), UseWriter: true, Private: o.ContainsKey("private")));
+        var svc = new ArticleService(writer);
+        var article = await svc.CreateAsync(result, video, new ArticleRequest(o.GetValueOrDefault("article-lang"), UseWriter: writer is not null, Private: o.ContainsKey("private")));
         foreach (var line in svc.Log) Console.Error.WriteLine("  " + line);
-        await File.WriteAllBytesAsync(Path.ChangeExtension(manualPath, ".docx"), ManualDocx.Write(manual));
-        await File.WriteAllTextAsync(Path.ChangeExtension(manualPath, ".html"), ManualRenderer.Html(manual));
-        await File.WriteAllTextAsync(Path.ChangeExtension(manualPath, ".md"), ManualRenderer.Markdown(manual));
-        Console.Error.WriteLine($"wrote {Path.ChangeExtension(manualPath, ".docx")} (+ .html, .md): {manual.Steps.Count} steps");
+        var md = ArticlePackage.WriteTo(article, folder);
+        Console.Error.WriteLine($"wrote {md} ({article.Steps.Count} steps, {article.Steps.Count(x => x.ScreenshotFile is not null)} screenshots)");
     }
     return 0;
 }

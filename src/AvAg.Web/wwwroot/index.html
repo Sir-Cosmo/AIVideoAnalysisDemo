@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AvAg — audio-visual action grounding demo</title>
+<title>AvAg — support call to wiki article</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
@@ -100,20 +100,24 @@
   .seg:hover, .seg.active { background: var(--panel-2); }
   .seg time { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .88rem; }
   .seg .spk { color: var(--speech); font-size: .85rem; margin-right: .4rem; }
-  /* ---------- manual ---------- */
-  section.manual { grid-column: 1 / -1; }
-  section.manual h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .5rem; color: var(--muted); }
-  .manual-bar { display: flex; gap: .75rem 1rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
-  .manual-bar label { color: var(--muted); font-size: .9rem; display: flex; gap: .4rem; align-items: center; }
-  .manual-bar select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .5rem; }
-  iframe.manual-view { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: var(--radius); background: #fff; }
+  /* ---------- wiki article ---------- */
+  section.article { grid-column: 1 / -1; }
+  section.article h2 { font-size: .95rem; font-weight: 600; margin: 0 0 .5rem; color: var(--muted); }
+  .article-bar { display: flex; gap: .75rem 1rem; align-items: center; flex-wrap: wrap; margin-bottom: .75rem; }
+  .article-bar label { color: var(--muted); font-size: .9rem; display: flex; gap: .4rem; align-items: center; }
+  .article-bar select { background: var(--bg); color: var(--text); border: 1px solid var(--line); border-radius: 4px; padding: .35rem .5rem; }
+  .tabs { display: flex; gap: .25rem; margin-bottom: -1px; }
+  .tabs button { background: none; color: var(--muted); border: 1px solid transparent; border-bottom: 0; border-radius: var(--radius) var(--radius) 0 0; padding: .4rem .9rem; cursor: pointer; font-weight: 500; }
+  .tabs button[aria-selected=true] { color: var(--text); background: var(--panel); border-color: var(--line); }
+  iframe.article-view { width: 100%; height: 70vh; border: 1px solid var(--line); border-radius: 0 var(--radius) var(--radius) var(--radius); background: #fff; }
+  pre.article-md { margin: 0; height: 70vh; overflow: auto; white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 0 var(--radius) var(--radius) var(--radius); padding: 1rem; font-size: .85rem; }
   .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <header>
-  <h1>AvAg demo</h1>
-  <p>Upload a screen recording. The pipeline finds the spoken instruction, the real click, and the UI element under it — and tells you how sure it is.</p>
+  <h1>Support call → wiki article</h1>
+  <p>Upload the recording of a support call. AvAg works out what the customer's problem was and how the supporter fixed it, and writes a wiki article in Markdown so the next customer can fix it themselves.</p>
 </header>
 
 <main>
@@ -132,7 +136,7 @@
         <input type="file" name="ui_json" accept=".json">
       </label>
 
-      <label class="field full private"><span><input type="checkbox" name="private" value="true" id="privateUpload"> Private video — the manual is text only, no screenshots are taken from the video</span></label>
+      <label class="field full private"><span><input type="checkbox" name="private" value="true" id="privateUpload"> Private video — the article is text only, no screenshots are taken from the video</span></label>
 
       <details class="advanced">
         <summary>Services and analysis settings</summary>
@@ -162,7 +166,7 @@
     <div class="stage" id="stage">
       <video id="player" controls preload="metadata" class="hidden"></video>
       <canvas id="overlay"></canvas>
-      <div class="empty" id="stageEmpty">Your video and the grounded clicks will appear here.</div>
+      <div class="empty" id="stageEmpty">Your recording and the detected clicks will appear here.</div>
     </div>
     <div class="status"><span class="state" id="state"></span><span id="statusText"></span></div>
     <pre class="log" id="log"></pre>
@@ -201,17 +205,24 @@
     </div>
   </section>
 
-  <section class="manual hidden" id="manualSection">
-    <h2>Manual — the video as step-by-step instructions</h2>
-    <div class="manual-bar">
-      <label>Language <select id="manualLang"><option value="">Same as spoken</option><option value="de">German</option><option value="en">English</option></select></label>
-      <label title="No frame of the video is extracted; the manual only explains in text"><input type="checkbox" id="manualPrivate"> Private — text only, no screenshots</label>
-      <label id="llmLabel" class="hidden"><input type="checkbox" id="manualLlm" checked> Summarise with <span id="llmName"></span></label>
-      <button class="btn" id="makeManual" type="button">Create manual</button>
-      <span class="note" id="manualNote"></span>
-      <span class="downloads hidden" id="manualDownloads"><a id="dlDocx">Word (.docx)</a><a id="dlHtml" target="_blank">Open as web page (print → PDF)</a><a id="dlMd">Markdown</a></span>
+  <section class="article hidden" id="articleSection">
+    <h2>Wiki article — problem, cause and solution from the call</h2>
+    <div class="article-bar">
+      <label>Language <select id="articleLang"><option value="">Same as spoken</option><option value="de">German</option><option value="en">English</option></select></label>
+      <label title="No frame of the video is extracted; the article only explains in text"><input type="checkbox" id="articlePrivate"> Private — text only, no screenshots</label>
+      <label id="llmLabel" class="hidden"><input type="checkbox" id="articleLlm" checked> Write with <span id="llmName"></span></label>
+      <button class="btn" id="makeArticle" type="button">Create wiki article</button>
+      <span class="note" id="articleNote"></span>
+      <span class="downloads hidden" id="articleDownloads"><a id="dlZip">Download for the wiki (.zip: Markdown + images)</a><a id="dlMd">Markdown only (.md)</a><button class="btn quiet" id="copyMd" type="button">Copy Markdown</button></span>
     </div>
-    <iframe class="manual-view hidden" id="manualView" title="Manual preview"></iframe>
+    <div class="hidden" id="articleTabs">
+      <div class="tabs" role="tablist">
+        <button type="button" role="tab" id="tabPreview" aria-selected="true">Preview</button>
+        <button type="button" role="tab" id="tabMarkdown" aria-selected="false">Markdown</button>
+      </div>
+      <iframe class="article-view" id="articleView" title="Article preview"></iframe>
+      <pre class="article-md hidden" id="articleMd"></pre>
+    </div>
   </section>
 
   <section class="transcript hidden" id="transcriptSection">
@@ -230,11 +241,14 @@
   let job = null, graph = null, items = [], activeIdx = -1, pollTimer = null;
 
   // ---- config defaults ----
+  // A URL field is only sent when it was changed: unchanged means "as configured" (keeps keys, fallbacks, file
+  // inputs and derived services), an emptied field switches that service off for the job.
+  const urlFields = ['asr_url', 'ui_url', 'molmo_url', 'sam2_url', 'qwen_url'], configured = {};
   fetch('/api/config').then(r => r.json()).then(c => {
-    $('asr_url').value = c.asr_url || ''; $('ui_url').value = c.ui_url || ''; $('molmo_url').value = c.molmo_url || '';
-    $('sam2_url').value = c.sam2_url || ''; $('qwen_url').value = c.qwen_url || ''; $('retention').textContent = c.retention_minutes;
+    urlFields.forEach(f => { configured[f] = c[f] || ''; $(f).value = configured[f]; });
+    $('retention').textContent = c.retention_minutes;
     if (!c.has_demo) demoBtn.classList.add('hidden');
-    if (c.manual_llm) { $('llmName').textContent = c.manual_llm; $('llmLabel').classList.remove('hidden'); }
+    if (c.article_llm) { $('llmName').textContent = c.article_llm; $('llmLabel').classList.remove('hidden'); }
   });
 
   // ---- drop zone ----
@@ -256,6 +270,7 @@
   demoBtn.addEventListener('click', () => { const fd = new FormData(form); fd.delete('video'); fd.set('use_demo', 'true'); submit(fd); });
 
   async function submit(fd) {
+    urlFields.forEach(f => { if ((fd.get(f) || '').trim() === (configured[f] ?? '')) fd.delete(f); });
     runBtn.disabled = true; demoBtn.disabled = true; $('formNote').textContent = ''; resetResults();
     setState('Uploading', '');
     const r = await fetch('/api/jobs', { method: 'POST', body: fd });
@@ -277,27 +292,45 @@
   }
 
   function setState(text, cls) { $('state').textContent = text; $('state').className = 'state ' + cls; $('statusText').textContent = ''; }
-  // ---- manual ----
-  $('makeManual').addEventListener('click', async () => {
-    const btn = $('makeManual'); btn.disabled = true;
-    const fd = new FormData(); fd.set('lang', $('manualLang').value); fd.set('private', String($('manualPrivate').checked)); fd.set('llm', String(!$('llmLabel').classList.contains('hidden') && $('manualLlm').checked));
+  // ---- wiki article ----
+  $('makeArticle').addEventListener('click', async () => {
+    const btn = $('makeArticle'); btn.disabled = true;
+    const fd = new FormData(); fd.set('lang', $('articleLang').value); fd.set('private', String($('articlePrivate').checked)); fd.set('llm', String(!$('llmLabel').classList.contains('hidden') && $('articleLlm').checked));
     // The language model runs on the CPU and needs a few minutes – show that something is happening.
-    const what = fd.get('llm') === 'true' ? 'The language model is writing the manual (runs on the CPU, usually 2–5 min)' : 'Writing the manual';
-    const t0 = Date.now(), tick = () => { const s = Math.round((Date.now() - t0) / 1000); $('manualNote').textContent = `${what}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+    const what = fd.get('llm') === 'true' ? 'The language model is writing the article (runs on the CPU, usually 2–5 min)' : 'Writing the article';
+    const t0 = Date.now(), tick = () => { const s = Math.round((Date.now() - t0) / 1000); $('articleNote').textContent = `${what}… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
     tick(); const timer = setInterval(tick, 1000);
     try {
-      const r = await fetch(`/api/jobs/${job}/manual`, { method: 'POST', body: fd }); const b = await r.json(); clearInterval(timer);
+      const r = await fetch(`/api/jobs/${job}/article`, { method: 'POST', body: fd }); const b = await r.json(); clearInterval(timer);
       if (!r.ok) throw new Error(b.error || r.statusText);
-      const fallback = (b.log || []).find(l => l.includes('kept the rule-based'));
-      $('manualNote').textContent = `${b.steps} steps${b.private ? ' · text only (private video)' : ''}${fallback ? ' · ' + fallback.replace('manual: ', '') : ''}`;
-      $('dlDocx').href = `/api/jobs/${job}/manual.docx`; $('dlMd').href = `/api/jobs/${job}/manual.md`; $('dlHtml').href = `/api/jobs/${job}/manual.html`;
-      $('manualDownloads').classList.remove('hidden');
-      $('manualView').src = `/api/jobs/${job}/manual.html?t=${Date.now()}`; $('manualView').classList.remove('hidden');
-    } catch (e) { clearInterval(timer); $('manualNote').innerHTML = `<span class="error">${esc(e.message)}</span>`; }
+      const fallback = (b.log || []).find(l => l.includes('rule-based article'));
+      const parts = [`${b.steps} steps`, b.private ? 'text only (private video)' : `${b.screenshots} screenshots`];
+      if (b.resolved === false) parts.push('problem not solved in the call');
+      if (b.redactions) parts.push(`${b.redactions} personal-data snippets removed`);
+      if (fallback) parts.push(fallback.replace('article: ', ''));
+      $('articleNote').textContent = parts.join(' · ');
+      $('dlZip').href = `/api/jobs/${job}/article.zip`; $('dlMd').href = `/api/jobs/${job}/article.md`;
+      $('dlZip').classList.toggle('hidden', !b.screenshots);
+      $('articleDownloads').classList.remove('hidden');
+      $('articleView').src = `/api/jobs/${job}/article.html?t=${Date.now()}`;
+      $('articleMd').textContent = await (await fetch(`/api/jobs/${job}/article.md`)).text();
+      $('articleTabs').classList.remove('hidden');
+    } catch (e) { clearInterval(timer); $('articleNote').innerHTML = `<span class="error">${esc(e.message)}</span>`; }
     btn.disabled = false;
   });
+  function showTab(md) {
+    $('tabPreview').setAttribute('aria-selected', String(!md)); $('tabMarkdown').setAttribute('aria-selected', String(md));
+    $('articleView').classList.toggle('hidden', md); $('articleMd').classList.toggle('hidden', !md);
+  }
+  $('tabPreview').addEventListener('click', () => showTab(false));
+  $('tabMarkdown').addEventListener('click', () => showTab(true));
+  $('copyMd').addEventListener('click', async () => {
+    try { await navigator.clipboard.writeText($('articleMd').textContent); $('copyMd').textContent = 'Copied'; }
+    catch { $('copyMd').textContent = 'Copy failed – use the Markdown tab'; }
+    setTimeout(() => $('copyMd').textContent = 'Copy Markdown', 2000);
+  });
 
-  function resetResults() { $('manualSection').classList.add('hidden'); $('manualView').classList.add('hidden'); $('manualDownloads').classList.add('hidden'); $('manualNote').textContent = ''; graph = null; items = []; activeIdx = -1; $('timeline').innerHTML = ''; $('segments').innerHTML = ''; $('transcriptSection').classList.add('hidden'); $('timelineEmpty').classList.remove('hidden'); $('detail').classList.add('hidden'); draw(); clearTimeout(pollTimer); }
+  function resetResults() { $('articleSection').classList.add('hidden'); $('articleTabs').classList.add('hidden'); $('articleDownloads').classList.add('hidden'); $('articleNote').textContent = ''; showTab(false); graph = null; items = []; activeIdx = -1; $('timeline').innerHTML = ''; $('segments').innerHTML = ''; $('transcriptSection').classList.add('hidden'); $('timelineEmpty').classList.remove('hidden'); $('detail').classList.add('hidden'); draw(); clearTimeout(pollTimer); }
   function showVideo(src) { player.src = src; player.classList.remove('hidden'); $('stageEmpty').classList.add('hidden'); }
 
   // ---- results ----
@@ -322,9 +355,9 @@
 
   function render(s) {
     renderTranscript(s.transcript);
-    $('manualSection').classList.remove('hidden');
-    // Private uploads stay private: the manual can only be text.
-    $('manualPrivate').checked = !!s.private; $('manualPrivate').disabled = !!s.private;
+    $('articleSection').classList.remove('hidden');
+    // Private uploads stay private: the article can only be text.
+    $('articlePrivate').checked = !!s.private; $('articlePrivate').disabled = !!s.private;
     graph = s.graph; if (!graph) return;
     items = [];
     graph.events.forEach((e, i) => {

@@ -1,6 +1,6 @@
-# CPU-only language model for the step-by-step manual (AvAg.Web "Create manual").
+# CPU-only language model that writes the wiki article (AvAg.Web "Create wiki article").
 # num_gpu 0 keeps every layer on the CPU so it never competes with WhisperX for a small laptop GPU.
-# Create once:  ollama create avag-manual -f sidecars/manual-llm.Modelfile
+# Create once:  ollama create avag-article -f sidecars/article-llm.Modelfile
 FROM qwen2.5:7b
 PARAMETER num_gpu 0
 PARAMETER num_ctx 12288

@@ -16,3 +16,13 @@ __pycache__/
 /{avag/
 # personal Claude Code settings
 .claude/settings.local.json
+# secrets – API keys go into user secrets or environment variables, never into the repository
+.env
+*.env
+.env.*
+secrets.json
+secrets*.json
+appsettings.*.local.json
+appsettings.Local.json
+*.pfx
+*.key

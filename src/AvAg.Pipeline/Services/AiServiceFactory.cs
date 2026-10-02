@@ -1,6 +1,6 @@
 using AvAg.Core;
 using AvAg.Pipeline.Adapters;
-using AvAg.Pipeline.Manuals;
+using AvAg.Pipeline.Articles;
 
 namespace AvAg.Pipeline.Services;
 
@@ -10,15 +10,17 @@ public sealed class ProviderRegistry<T> where T : class
     private readonly Dictionary<string, Func<ServiceOptions, T>> _providers = new(StringComparer.OrdinalIgnoreCase);
     private readonly string _capability;
 
-    public ProviderRegistry(string capability, string? defaultProvider)
+    public ProviderRegistry(string capability, string? defaultProvider, TimeSpan defaultTimeout)
     {
         _capability = capability;
         DefaultProvider = defaultProvider;
+        DefaultTimeout = defaultTimeout;
     }
 
     /// <summary>Provider used when the options name none but give a URL or file.</summary>
     public string? DefaultProvider { get; set; }
-    public IReadOnlyCollection<string> Names => _providers.Keys;
+    /// <summary>Request timeout when the options set none.</summary>
+    public TimeSpan DefaultTimeout { get; set; }
 
     /// <summary>Adds or replaces a provider. Several names may point to the same constructor (aliases).</summary>
     public ProviderRegistry<T> Register(string name, Func<ServiceOptions, T> create, params string[] aliases)
@@ -27,17 +29,16 @@ public sealed class ProviderRegistry<T> where T : class
         return this;
     }
 
-    /// <summary>The provider name these options select, or null when the capability is switched off.</summary>
+    /// <summary>The provider name these options select, or null when the capability is off.</summary>
     public string? Resolve(ServiceOptions? o)
     {
-        if (o is null) return null;
-        string? name = string.IsNullOrWhiteSpace(o.Provider)
-            ? (string.IsNullOrWhiteSpace(o.Url) && string.IsNullOrWhiteSpace(o.Path) ? null : DefaultProvider)
-            : o.Provider.Trim();
-        return name is null || name.Equals(ServiceOptions.None, StringComparison.OrdinalIgnoreCase) ? null : name;
+        if (o is null || o.IsOff) return null;
+        if (!string.IsNullOrWhiteSpace(o.Provider)) return o.Provider.Trim();
+        return string.IsNullOrWhiteSpace(o.Url) && string.IsNullOrWhiteSpace(o.Path) ? null : DefaultProvider;
     }
 
-    /// <summary>The configured implementation, or null when the capability is switched off.</summary>
+    /// <summary>The configured implementation, or null when the capability is off.
+    /// Throws <see cref="InvalidOperationException"/> for an unknown provider or missing Url/Path.</summary>
     public T? Create(ServiceOptions? o)
     {
         if (Resolve(o) is not { } name) return null;
@@ -48,11 +49,14 @@ public sealed class ProviderRegistry<T> where T : class
 
     /// <summary>The Url, or a clear error naming the capability and provider.</summary>
     public string RequireUrl(ServiceOptions o) => string.IsNullOrWhiteSpace(o.Url)
-        ? throw new InvalidOperationException($"{_capability} provider \"{o.Provider ?? DefaultProvider}\" needs a Url.") : o.Url;
+        ? throw new InvalidOperationException($"{_capability} provider \"{Resolve(o)}\" needs a Url.") : o.Url;
 
     /// <summary>The Path, or a clear error naming the capability and provider.</summary>
     public string RequirePath(ServiceOptions o) => string.IsNullOrWhiteSpace(o.Path)
-        ? throw new InvalidOperationException($"{_capability} provider \"{o.Provider}\" needs a Path.") : o.Path;
+        ? throw new InvalidOperationException($"{_capability} provider \"{Resolve(o)}\" needs a Path.") : o.Path;
+
+    /// <summary>The configured timeout, or this capability's default.</summary>
+    public TimeSpan Timeout(ServiceOptions o) => o.TimeoutOr(DefaultTimeout);
 }
 
 /// <summary>
@@ -62,56 +66,91 @@ public sealed class ProviderRegistry<T> where T : class
 /// </summary>
 public sealed class AiServiceFactory
 {
-    public ProviderRegistry<IAsrService> Asr { get; } = new("Asr", "whisperx");
-    public ProviderRegistry<IUiParser> UiParser { get; } = new("UiParser", "omniparser");
-    public ProviderRegistry<IVideoGrounder> Grounder { get; } = new("Grounder", "molmo");
-    public ProviderRegistry<IObjectTracker> Tracker { get; } = new("Tracker", "sam2");
-    public ProviderRegistry<IClipDescriber> ClipDescriber { get; } = new("ClipDescriber", "qwen-vl");
-    public ProviderRegistry<ITextGenerator> TextGenerator { get; } = new("TextGenerator", "openai-compatible");
+    private static readonly TimeSpan SidecarTimeout = TimeSpan.FromMinutes(30), LlmTimeout = TimeSpan.FromMinutes(10);
+
+    public ProviderRegistry<IAsrService> Asr { get; } = new("Asr", "whisperx", SidecarTimeout);
+    public ProviderRegistry<IUiParser> UiParser { get; } = new("UiParser", "omniparser", SidecarTimeout);
+    public ProviderRegistry<IVideoGrounder> Grounder { get; } = new("Grounder", "molmo", SidecarTimeout);
+    public ProviderRegistry<IObjectTracker> Tracker { get; } = new("Tracker", "sam2", SidecarTimeout);
+    public ProviderRegistry<IClipDescriber> ClipDescriber { get; } = new("ClipDescriber", "qwen-vl", SidecarTimeout);
+    public ProviderRegistry<ITextGenerator> TextGenerator { get; } = new("TextGenerator", "openai-compatible", LlmTimeout);
 
     /// <summary>A factory with all built-in providers.</summary>
     public static AiServiceFactory CreateDefault()
     {
         var f = new AiServiceFactory();
-        f.Asr.Register("whisperx", o => new WhisperXSidecar(f.Asr.RequireUrl(o), timeout: o.Timeout))
-             .Register("whisperx-json", o => new JsonFileAsr(f.Asr.RequirePath(o)));
-        f.UiParser.Register("omniparser", o => new OmniParserSidecar(f.UiParser.RequireUrl(o), timeout: o.Timeout))
+        f.Asr.Register("whisperx", o => new WhisperXSidecar(f.Asr.RequireUrl(o), o.ApiKey, f.Asr.Timeout(o)))
+             .Register("whisperx-json", o => new JsonFileAsr(f.Asr.RequirePath(o)))
+             .Register("openai", o => new OpenAiTranscriber(f.Asr.RequireUrl(o), o.Model, o.ApiKey, f.Asr.Timeout(o), o.Prompt, o.AlignUrl));
+        f.UiParser.Register("omniparser", o => new OmniParserSidecar(f.UiParser.RequireUrl(o), o.ApiKey, f.UiParser.Timeout(o)))
                   .Register("ui-json", o => new JsonFileUiParser(f.UiParser.RequirePath(o)));
-        f.Grounder.Register("molmo", o => new MolmoPointSidecar(f.Grounder.RequireUrl(o), timeout: o.Timeout))
-                  .Register("qwen-vl", o => new Qwen3VlClient(f.Grounder.RequireUrl(o), o.Model, timeout: o.Timeout));
-        f.Tracker.Register("sam2", o => new Sam2Sidecar(f.Tracker.RequireUrl(o), timeout: o.Timeout));
-        f.ClipDescriber.Register("qwen-vl", o => new Qwen3VlClient(f.ClipDescriber.RequireUrl(o), o.Model, timeout: o.Timeout));
+        f.Grounder.Register("molmo", o => new MolmoPointSidecar(f.Grounder.RequireUrl(o), o.ApiKey, f.Grounder.Timeout(o)))
+                  .Register("qwen-vl", o => new Qwen3VlClient(f.Grounder.RequireUrl(o), o.Model, o.ApiKey, f.Grounder.Timeout(o)));
+        f.Tracker.Register("sam2", o => new Sam2Sidecar(f.Tracker.RequireUrl(o), o.ApiKey, f.Tracker.Timeout(o)));
+        f.ClipDescriber.Register("qwen-vl", o => new Qwen3VlClient(f.ClipDescriber.RequireUrl(o), o.Model, o.ApiKey, f.ClipDescriber.Timeout(o)));
         f.TextGenerator.Register("openai-compatible",
-            o => new OpenAiCompatibleTextGenerator(f.TextGenerator.RequireUrl(o), o.Model, o.ApiKey, o.Timeout),
+            o => new OpenAiCompatibleTextGenerator(f.TextGenerator.RequireUrl(o), o.Model, o.ApiKey, f.TextGenerator.Timeout(o), o.Vision, o.ReasoningEffort),
             "ollama", "openai", "azure-openai", "lm-studio", "vllm");
         return f;
-    }
-
-    /// <summary>Provider and endpoint per capability for logs and status pages – never API keys.</summary>
-    public IReadOnlyDictionary<string, string?> Describe(AiServicesOptions o)
-    {
-        static string? Where(string? provider, ServiceOptions s) =>
-            provider is null ? null : provider + (s.Url is null ? "" : " @ " + s.Url) + (s.Path is null ? "" : " (file)");
-        return new Dictionary<string, string?>
-        {
-            ["asr"] = Where(Asr.Resolve(o.Asr), o.Asr), ["ui_parser"] = Where(UiParser.Resolve(o.UiParser), o.UiParser),
-            ["grounder"] = Where(Grounder.Resolve(o.Grounder), o.Grounder), ["tracker"] = Where(Tracker.Resolve(o.Tracker), o.Tracker),
-            ["clip_describer"] = Where(ClipDescriber.Resolve(o.ClipDescriber), o.ClipDescriber),
-            ["text_generator"] = Where(TextGenerator.Resolve(o.TextGenerator), o.TextGenerator),
-        };
     }
 
     /// <summary>Everything the analysis pipeline needs. Speech recognition is required; the rest is optional.</summary>
     public PipelineServices CreatePipelineServices(AiServicesOptions o) => new()
     {
-        Asr = Asr.Create(o.Asr) ?? throw new InvalidOperationException("No speech recognition configured: set Services:Asr or provide a transcript file."),
+        Asr = CreateAsr(o.EffectiveAsr) ?? throw new InvalidOperationException("Speech recognition is switched off: configure Services:Asr or provide a transcript file."),
         UiParser = UiParser.Create(o.UiParser) ?? new NullUiParser(),
         Grounder = Grounder.Create(o.Grounder),
         Tracker = Tracker.Create(o.Tracker),
         ClipDescriber = ClipDescriber.Create(o.ClipDescriber),
     };
 
-    /// <summary>The manual writer for the configured language model, or null to keep the rule-based manual.</summary>
-    public IManualWriter? CreateManualWriter(AiServicesOptions o) =>
-        TextGenerator.Create(o.TextGenerator) is { } llm ? new LlmManualWriter(llm) : null;
+    /// <summary>The article writer for the configured language model, or null to keep the rule-based article.
+    /// Throws <see cref="InvalidOperationException"/> when the configuration is invalid.</summary>
+    public IArticleWriter? CreateArticleWriter(AiServicesOptions o) =>
+        CreateTextGenerator(o.TextGenerator) is { } llm ? new LlmArticleWriter(llm) : null;
+
+    /// <summary>Speech recognition with its fallback chain (e.g. OpenAI → local WhisperX).</summary>
+    public IAsrService? CreateAsr(ServiceOptions o)
+    {
+        var primary = Asr.Create(o);
+        var fallback = o.Fallback is { } fb ? CreateAsr(fb) : null;
+        return primary is null ? fallback
+             : fallback is null ? primary
+             : new FallbackAsrService(primary, Asr.Resolve(o)!, fallback, Asr.Resolve(o.Fallback)!);
+    }
+
+    /// <summary>Language model with its fallback chain (e.g. OpenAI → local Ollama).</summary>
+    public ITextGenerator? CreateTextGenerator(ServiceOptions o)
+    {
+        var primary = TextGenerator.Create(o);
+        var fallback = o.Fallback is { } fb ? CreateTextGenerator(fb) : null;
+        return primary is null ? fallback : fallback is null ? primary : new FallbackTextGenerator(primary, fallback);
+    }
+
+    /// <summary>Like <see cref="CreateArticleWriter"/>, but a broken configuration returns null and the reason,
+    /// so the caller can still produce the rule-based article.</summary>
+    public IArticleWriter? TryCreateArticleWriter(AiServicesOptions o, out string? problem)
+    {
+        problem = null;
+        try { return CreateArticleWriter(o); }
+        catch (InvalidOperationException ex) { problem = ex.Message; return null; }
+    }
+
+    /// <summary>Provider and endpoint per capability for logs and status pages – never API keys.</summary>
+    public IReadOnlyDictionary<string, string?> Describe(AiServicesOptions o)
+    {
+        string? Where<T>(ProviderRegistry<T> registry, ServiceOptions s) where T : class
+        {
+            var parts = s.WithFallbacks().Select(x => registry.Resolve(x) is { } p
+                ? p + (x.Model is null ? "" : " " + x.Model) + (x.Url is null ? "" : " @ " + x.Url) + (x.Path is null ? "" : " (file)") : null)
+                .Where(x => x is not null).ToList();
+            return parts.Count == 0 ? null : string.Join(" → fallback ", parts);
+        }
+        return new Dictionary<string, string?>
+        {
+            ["asr"] = Where(Asr, o.EffectiveAsr), ["ui_parser"] = Where(UiParser, o.UiParser),
+            ["grounder"] = Where(Grounder, o.Grounder), ["tracker"] = Where(Tracker, o.Tracker),
+            ["clip_describer"] = Where(ClipDescriber, o.ClipDescriber), ["text_generator"] = Where(TextGenerator, o.TextGenerator),
+        };
+    }
 }

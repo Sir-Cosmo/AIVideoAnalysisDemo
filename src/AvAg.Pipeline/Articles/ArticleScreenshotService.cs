@@ -3,17 +3,17 @@ using System.Text;
 using AvAg.Core;
 using AvAg.Pipeline.Media;
 
-namespace AvAg.Pipeline.Manuals;
+namespace AvAg.Pipeline.Articles;
 
 /// <summary>
-/// Picks and extracts the screenshot of each manual step with FFmpeg (CPU only). The planned moments come from
-/// <see cref="ManualBuilder.PlaceScreenshots"/>; this class refines them by looking at the video and then renders the
+/// Picks and extracts the screenshot of each solution step with FFmpeg (CPU only). The planned moments come from
+/// <see cref="ArticleBuilder.PlaceScreenshots"/>; this class refines them by looking at the video and then renders the
 /// JPEGs, drawing the click marker where a click was observed.
 /// </summary>
-public sealed class ManualScreenshotService
+public sealed class ArticleScreenshotService
 {
     private readonly FfmpegService _ff;
-    public ManualScreenshotService(FfmpegService ff) => _ff = ff;
+    public ArticleScreenshotService(FfmpegService ff) => _ff = ff;
 
     public int ScreenshotWidth { get; init; } = 1280;
     /// <summary>Mean absolute difference (0–255) below which two thumbnails count as "the same screen".</summary>
@@ -25,7 +25,7 @@ public sealed class ManualScreenshotService
     /// differs most from the previous step's screenshot. If every candidate looks like the previous screenshot, the step
     /// gets no picture instead of a repeated one.
     /// </summary>
-    public async Task<string> RefineTimesAsync(Manual m, string videoPath, CancellationToken ct)
+    public async Task<string> RefineTimesAsync(WikiArticle m, string videoPath, CancellationToken ct)
     {
         GrayFrame? prev = null;
         int moved = 0, dropped = 0;
@@ -60,8 +60,55 @@ public sealed class ManualScreenshotService
         return $"screenshots – {moved} moved to a settled, distinct frame, {dropped} skipped (same screen as the step before)";
     }
 
+    /// <summary>
+    /// Up to <paramref name="max"/> frames that show what happened on the supporter's screen, for a vision model:
+    /// the video is scanned at 1 fps as thumbnails; a frame qualifies when the screen has just changed and then
+    /// settled, or when a click was observed; near-duplicates are dropped; the biggest changes win when there are too
+    /// many. Returned in time order as 1280-px JPEGs labelled "Bild n (mm:ss)".
+    /// </summary>
+    public async Task<IReadOnlyList<PromptImage>> KeyframesAsync(string videoPath, EventGraph graph, CancellationToken ct, int max = 12)
+    {
+        var thumbs = await _ff.DecodeGrayFramesAsync(videoPath, 1, scaleWidth: 160, ct: ct);
+        if (thumbs.Count == 0) return [];
+        var clicks = graph.Events.Where(e => e.GroundingStatus is GroundingStatus.Observed or GroundingStatus.Tracked).Select(e => e.Temporal.PeakS).ToList();
+
+        // Score each second: how much it differs from the frame before, settled (little change to the next one), clicks first.
+        var candidates = new List<(GrayFrame Frame, double Score)> { (thumbs[0], 50) };
+        for (int i = 1; i < thumbs.Count; i++)
+        {
+            double change = Diff(thumbs[i], thumbs[i - 1]);
+            double unsettled = i + 1 < thumbs.Count ? Diff(thumbs[i], thumbs[i + 1]) : 0;
+            bool click = clicks.Any(c => Math.Abs(c - thumbs[i].PtsS) <= 0.75);
+            if (change >= SameScreenThreshold && unsettled < SameScreenThreshold * 2 || click)
+                candidates.Add((thumbs[i], change + (click ? 100 : 0)));
+        }
+        var chosen = new List<GrayFrame>();
+        foreach (var (frame, _) in candidates.OrderByDescending(c => c.Score))
+        {
+            if (chosen.Count >= max) break;
+            if (chosen.All(c => Diff(c, frame) >= SameScreenThreshold && Math.Abs(c.PtsS - frame.PtsS) >= 2)) chosen.Add(frame);
+        }
+
+        var images = new List<PromptImage>();
+        int n = 0;
+        foreach (var f in chosen.OrderBy(f => f.PtsS))
+        {
+            var tmp = Path.Combine(Path.GetTempPath(), $"avag_frame_{Guid.NewGuid():N}.jpg");
+            try
+            {
+                var (_, _, code) = await FfmpegService.RunAsync(_ff.FfmpegPath,
+                    ["-y", "-loglevel", "error", "-ss", f.PtsS.ToString("0.###", CultureInfo.InvariantCulture), "-i", videoPath,
+                     "-frames:v", "1", "-vf", $"scale='min({ScreenshotWidth},iw)':-2", "-q:v", "5", tmp], null, ct);
+                if (code == 0 && File.Exists(tmp))
+                    images.Add(new PromptImage($"Bild {++n} ({ArticleRenderer.Ts(f.PtsS)})", await File.ReadAllBytesAsync(tmp, ct)));
+            }
+            finally { try { File.Delete(tmp); } catch { /* best effort */ } }
+        }
+        return images;
+    }
+
     /// <summary>Extracts one JPEG per step that has a screenshot moment; returns a message per failed frame.</summary>
-    public async Task<List<string>> ExtractAsync(Manual m, string videoPath, VideoInfo v, CancellationToken ct)
+    public async Task<List<string>> ExtractAsync(WikiArticle m, string videoPath, VideoInfo v, CancellationToken ct)
     {
         var problems = new List<string>();
         int w = Math.Min(ScreenshotWidth, v.WidthPx > 0 ? v.WidthPx : ScreenshotWidth);
@@ -70,7 +117,7 @@ public sealed class ManualScreenshotService
         {
             if (s.ScreenshotS is not { } t) continue;
             t = Math.Clamp(t, 0, Math.Max(0, v.DurationS - 0.1));
-            var tmp = Path.Combine(Path.GetTempPath(), $"avag_manual_{Guid.NewGuid():N}.jpg");
+            var tmp = Path.Combine(Path.GetTempPath(), $"avag_article_{Guid.NewGuid():N}.jpg");
             try
             {
                 var (_, err, code) = await FfmpegService.RunAsync(_ff.FfmpegPath,
@@ -86,7 +133,7 @@ public sealed class ManualScreenshotService
     }
 
     /// <summary>FFmpeg filter: red boxes around the observed click (and its UI element), then scale to the output width.</summary>
-    private static string Filter(ManualStep s, VideoInfo v, int width)
+    private static string Filter(ArticleStep s, VideoInfo v, int width)
     {
         var vf = new StringBuilder();
         int stroke = Math.Max(3, v.WidthPx / 400);
