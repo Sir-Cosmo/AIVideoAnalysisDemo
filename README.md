@@ -13,7 +13,8 @@ and writes a **wiki article in Markdown**. The next customer with the same probl
 
 * **Normal video:** every solution step gets a screenshot from the recording, with the click marked where it was
   observed.
-* **Private video:** the article is text only, and no frame is ever taken from the video.
+* **Private video:** the article is text only, no frame is ever taken from the video, and only local services
+  (this machine or the local network) see the call – nothing goes to OpenAI.
 
 **AI used (configurable):**
 * **OpenAI:** `gpt-4o-transcribe-diarize` for speech recognition with customer/supporter labels, and `gpt-5.5` for
@@ -328,6 +329,11 @@ Tick **Private video** when uploading, or **Private – text only** next to *Cre
 `--private`). The article is then text only: **no frame is extracted from the video** and no click position is
 kept. A video marked private at upload can never get screenshots later.
 
+Private also means **local services only**: every cloud entry (OpenAI, any URL outside `localhost` / the private
+network ranges) is dropped from the service chains, so speech recognition runs on the local WhisperX and the
+article is written by the local model (Ollama) or by the rule-based builder. A private upload is refused if no
+local speech recognition is configured; upload a transcript JSON in that case.
+
 ### 5.2 Personal data in the article
 
 Support calls are full of personal data. Three layers keep it out of the wiki:
@@ -359,9 +365,9 @@ The article never mentions the video's file name, the date of the call or who ca
 
   | | Normal video | Private video |
   |---|---|---|
-  | Audio of the call (MP3) | yes | yes |
-  | Transcript with speaker labels | yes | yes |
-  | Observed clicks (time and position) | yes | yes |
+  | Audio of the call (MP3) | yes | **never** |
+  | Transcript with speaker labels | yes | **never** |
+  | Observed clicks (time and position) | yes | **never** |
   | Frames of the screen | up to 12 | **never** |
   | The video file | never | never |
 
@@ -467,7 +473,7 @@ Fully local: leave out the `--asr-*` and use `--llm-url http://127.0.0.1:11434/v
 | `--lang de\|en\|auto` | spoken language (default `de`) |
 | `--article <folder>` | write the wiki article into this folder |
 | `--article-lang de\|en` | article language (default: spoken language) |
-| `--private` | text only, no screenshots |
+| `--private` | text only, no screenshots, local services only |
 | `--llm-url`, `--llm-model`, `--llm-key`, `--llm-provider` | the language model that writes the article (without: rule-based). A broken configuration is reported before the analysis starts. |
 | `--llm-vision`, `--llm-effort <level>` | send screen frames to a vision model; reasoning effort |
 | `--asr-provider openai`, `--asr-model`, `--asr-align <url>`, `--asr-prompt "<terms>"` | OpenAI speech recognition, word alignment via local WhisperX, vocabulary |
@@ -495,7 +501,7 @@ Other commands: `avag eval --pred <graph.json> --gt <groundtruth.json>` and `ava
       "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-4o-transcribe-diarize", "AlignUrl": "http://127.0.0.1:8011",
       "Fallback": { "Provider": "whisperx", "Url": "http://127.0.0.1:8011", "LocalModule": "whisperx_server:app" }
     },
-    "UiParser": { "Provider": "none" }, "Grounder": { "Provider": "none" }, "Tracker": { "Provider": "none" }, "ClipDescriber": { "Provider": "none" },
+    "UiParser": { "Provider": "none" }, "Grounder": {}, "Tracker": { "Provider": "none" }, "ClipDescriber": { "Provider": "none" },
     "TextGenerator": {
       "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-5.5", "Vision": true, "ReasoningEffort": "medium", "TimeoutSeconds": 600,
       "Fallback": { "Provider": "ollama", "Url": "http://127.0.0.1:11434/v1", "Model": "avag-article", "TimeoutSeconds": 900 }
@@ -538,7 +544,7 @@ The pipeline only knows six small interfaces (`src/AvAg.Core/Abstractions/AiServ
 
 | Capability (config key) | Interface | Built-in providers |
 |---|---|---|
-| Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file), `openai` (`gpt-4o-transcribe-diarize`, `whisper-1`, …) |
+| Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file), `openai` (`gpt-4o-transcribe-diarize` up to 23 min, `whisper-1`; text-only models are refused) |
 | UI elements + text (`UiParser`) | `IUiParser` | `omniparser` (default), `ui-json` (file) |
 | Fallback pointing (`Grounder`) | `IVideoGrounder` | `molmo` (default), `qwen-vl` |
 | Box tracking (`Tracker`) | `IObjectTracker` | `sam2` |

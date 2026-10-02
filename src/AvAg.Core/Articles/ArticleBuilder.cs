@@ -37,7 +37,7 @@ public sealed class ArticleBuilder
         @"\b(?:fehler)?meldung(?:en)?\s*[:,]\s*(?<t>[^.!?]{3,80})|\berror(?: message)?(?: says)?\s*[:,]\s*(?<t>[^.!?]{3,80})", Opts);
     // It works again.
     private static readonly Regex SuccessRx = new(
-        @"\b(funktioniert (?:jetzt|wieder)|geht (?:jetzt|wieder)|klappt (?:jetzt|wieder)|jetzt (?:geht|funktioniert|klappt) es|sieht gut aus|ist (?:jetzt )?(?:behoben|erledigt)|ist jetzt (?:da|weg)|ist (?:da|weg)[.!]?$|" +
+        @"\b(funktioniert (?:jetzt|wieder)|geht (?:jetzt|wieder)|klappt (?:jetzt|wieder)|jetzt (?:geht|funktioniert|klappt) es|sieht gut aus|ist (?:jetzt )?(?:behoben|erledigt)|ist jetzt (?:da|weg)|ist (?:da|weg)(?=[.!]?$)|" +
         @"works (?:now|again)|it's working|that (?:worked|fixed it)|is (?:fixed|gone|back) now)\b", Opts);
     // Instructions the click parser does not cover (it only knows pointer actions): open, go to, save, copy, …
     private static readonly Regex InstructionRx = new(

@@ -56,7 +56,65 @@ public sealed class FallbackTextGenerator(ITextGenerator primary, ITextGenerator
     {
         _used = primary;
         return await Fallback.RunAsync(() => primary.GenerateAsync(request, ct),
-            () => { _used = fallback; return fallback.GenerateAsync(fallback.SupportsImages ? request : request with { Images = [] }, ct); },
+            () => { _used = fallback; return fallback.GenerateAsync(fallback.SupportsImages ? request : request.TextOnly(), ct); },
             primary.Name, fallback.Name, _notes, ct);
     }
+}
+
+/// <summary>
+/// Fallback for services called many times per video (frames, clips, events): after the primary failed once, the rest of
+/// the run uses the fallback directly instead of waiting for the same failure again on every call.
+/// </summary>
+internal sealed class StickyFallback<T>(T primary, string primaryName, T fallback, string fallbackName)
+{
+    private readonly List<string> _notes = new();
+    private volatile bool _primaryFailed;
+
+    public IReadOnlyList<string> Notes { get { lock (_notes) return _notes.ToList(); } }
+
+    public async Task<TResult> RunAsync<TResult>(Func<T, Task<TResult>> call, CancellationToken ct)
+    {
+        if (!_primaryFailed)
+        {
+            try { return await call(primary); }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _primaryFailed = true;
+                lock (_notes) _notes.Add($"{primaryName} not usable ({(ex.Message.Length <= 200 ? ex.Message : ex.Message[..200] + " …")}) – used {fallbackName} for the rest of the run");
+            }
+        }
+        return await call(fallback);
+    }
+}
+
+public sealed class FallbackUiParser(IUiParser primary, string primaryName, IUiParser fallback, string fallbackName) : IUiParser, IReportsFallback
+{
+    private readonly StickyFallback<IUiParser> _f = new(primary, primaryName, fallback, fallbackName);
+    public IReadOnlyList<string> FallbackNotes => _f.Notes;
+    public Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, CancellationToken ct = default) =>
+        _f.RunAsync(s => s.ParseAsync(framePngPath, ct), ct);
+}
+
+public sealed class FallbackGrounder(IVideoGrounder primary, string primaryName, IVideoGrounder fallback, string fallbackName) : IVideoGrounder, IReportsFallback
+{
+    private readonly StickyFallback<IVideoGrounder> _f = new(primary, primaryName, fallback, fallbackName);
+    public IReadOnlyList<string> FallbackNotes => _f.Notes;
+    public Task<IReadOnlyList<VideoPoint>> PointAsync(string videoPath, string prompt, double startS, double endS, CancellationToken ct = default) =>
+        _f.RunAsync(s => s.PointAsync(videoPath, prompt, startS, endS, ct), ct);
+}
+
+public sealed class FallbackTracker(IObjectTracker primary, string primaryName, IObjectTracker fallback, string fallbackName) : IObjectTracker, IReportsFallback
+{
+    private readonly StickyFallback<IObjectTracker> _f = new(primary, primaryName, fallback, fallbackName);
+    public IReadOnlyList<string> FallbackNotes => _f.Notes;
+    public Task<IReadOnlyList<TrackSample>> TrackAsync(string videoPath, double seedTimeS, Point2D? seedPoint, BBox? seedBox, double startS, double endS, CancellationToken ct = default) =>
+        _f.RunAsync(s => s.TrackAsync(videoPath, seedTimeS, seedPoint, seedBox, startS, endS, ct), ct);
+}
+
+public sealed class FallbackClipDescriber(IClipDescriber primary, string primaryName, IClipDescriber fallback, string fallbackName) : IClipDescriber, IReportsFallback
+{
+    private readonly StickyFallback<IClipDescriber> _f = new(primary, primaryName, fallback, fallbackName);
+    public IReadOnlyList<string> FallbackNotes => _f.Notes;
+    public Task<string> DescribeAsync(string videoPath, double startS, double endS, string language, CancellationToken ct = default) =>
+        _f.RunAsync(s => s.DescribeAsync(videoPath, startS, endS, language, ct), ct);
 }

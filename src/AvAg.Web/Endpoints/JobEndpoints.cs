@@ -88,14 +88,18 @@ public static class JobEndpoints
             await Http.SaveAsync(cur, job.CursorPath);
         }
 
+        job.Private = form["private"] == "true";
         var services = settings.Services.WithOverrides(new ServiceOverrides(
             AsrUrl: Http.Field(form, "asr_url"), UiParserUrl: Http.Field(form, "ui_url"), GrounderUrl: Http.Field(form, "molmo_url"),
             TrackerUrl: Http.Field(form, "sam2_url"), ClipDescriberUrl: Http.Field(form, "qwen_url"),
             TranscriptFile: transcriptFile, UiElementsFile: uiFile));
+        // A private video never leaves this machine / network: no cloud speech recognition, no cloud models.
+        if (job.Private) services = services.LocalOnly();
         if (factory.Asr.Resolve(services.Asr) is null)
-            return Reject("No way to get speech: either upload a WhisperX transcript JSON or set the speech-recognition URL.");
+            return Reject(job.Private
+                ? "No local speech recognition for a private video: start the local WhisperX sidecar or upload a WhisperX transcript JSON."
+                : "No way to get speech: either upload a WhisperX transcript JSON or set the speech-recognition URL.");
 
-        job.Private = form["private"] == "true";
         job.Options = new RunOptions
         {
             Services = services, ServiceSummary = factory.Describe(services),

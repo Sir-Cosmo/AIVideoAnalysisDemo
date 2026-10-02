@@ -57,7 +57,7 @@ static void Usage()
       Wiki article:
         --article <folder>             write the wiki article: <folder>/article.md + <folder>/images/step-NN.jpg
         --article-lang <de|en>         article language (default: spoken language)
-        --private                      private video: text only, no screenshots are taken
+        --private                      private video: text only, no screenshots, only local services (no cloud)
         --llm-url <url/v1> --llm-model <name> [--llm-key <key>]
                                        language model that writes the article (default: rule-based)
 
@@ -81,21 +81,23 @@ static Dictionary<string, string> ParseOptions(IEnumerable<string> args)
 }
 
 /// <summary>CLI flags → the same service configuration the web app reads from appsettings.json.
-/// The shortcuts go through <see cref="AiServicesOptions.WithOverrides"/>, the same rules the web page uses.</summary>
+/// The URL shortcuts (--molmo-url, --sam2-url, --qwen-url) are the same as --<cap>-url, so explicit --<cap>-* flags
+/// (provider, key, …) apply to them; transcript / UI files and the Qwen fallback pointing go through
+/// <see cref="AiServicesOptions.WithOverrides"/>, the same rules the web page uses. --private keeps only local services.</summary>
 static AiServicesOptions ServicesFrom(Dictionary<string, string> o)
 {
     var s = new AiServicesOptions
     {
-        Asr = Apply(new(), "asr"), UiParser = Apply(new(), "ui"), Grounder = Apply(new(), "grounder"),
-        Tracker = Apply(new(), "tracker"), ClipDescriber = Apply(new(), "describer"), TextGenerator = Apply(new(), "llm"),
-    };
-    return s.WithOverrides(new ServiceOverrides(
-        GrounderUrl: o.GetValueOrDefault("molmo-url"), TrackerUrl: o.GetValueOrDefault("sam2-url"), ClipDescriberUrl: o.GetValueOrDefault("qwen-url"),
-        TranscriptFile: o.GetValueOrDefault("transcript"), UiElementsFile: o.GetValueOrDefault("ui-json")));
+        Asr = Apply("asr"), UiParser = Apply("ui"), Grounder = Apply("grounder", "molmo-url"),
+        Tracker = Apply("tracker", "sam2-url"), ClipDescriber = Apply("describer", "qwen-url"), TextGenerator = Apply("llm"),
+    }.WithOverrides(new ServiceOverrides(TranscriptFile: o.GetValueOrDefault("transcript"), UiElementsFile: o.GetValueOrDefault("ui-json")));
+    return o.ContainsKey("private") ? s.LocalOnly() : s;
 
-    ServiceOptions Apply(ServiceOptions so, string cap)
+    ServiceOptions Apply(string cap, string? shortcut = null)
     {
-        if (o.TryGetValue($"{cap}-url", out var url)) so = string.IsNullOrWhiteSpace(url) ? ServiceOptions.Off() : new ServiceOptions { Url = url.Trim() };
+        var so = new ServiceOptions();
+        if (o.TryGetValue($"{cap}-url", out var url) || shortcut is not null && o.TryGetValue(shortcut, out url))
+            so = string.IsNullOrWhiteSpace(url) ? ServiceOptions.Off() : new ServiceOptions { Url = url.Trim() };
         if (o.TryGetValue($"{cap}-provider", out var p)) so.Provider = p;
         if (o.TryGetValue($"{cap}-model", out var m)) so.Model = m;
         if (o.TryGetValue($"{cap}-key", out var k)) so.ApiKey = k;

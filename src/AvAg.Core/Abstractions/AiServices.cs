@@ -58,6 +58,11 @@ public sealed record TextGenerationRequest(string System, string User, bool Json
 {
     /// <summary>Images for models that can read them (<see cref="ITextGenerator.SupportsImages"/>); others never get any.</summary>
     public IReadOnlyList<PromptImage> Images { get; init; } = [];
+    /// <summary>The same prompt written for a model that gets no images (no mention of them); null = just drop the images.</summary>
+    public TextGenerationRequest? WithoutImages { get; init; }
+
+    /// <summary>The request for a model that cannot read images.</summary>
+    public TextGenerationRequest TextOnly() => Images.Count == 0 ? this : WithoutImages ?? this with { Images = [], WithoutImages = null };
 }
 
 /// <summary>

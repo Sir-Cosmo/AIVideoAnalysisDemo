@@ -207,6 +207,10 @@ public sealed class PipelineRunner
                 foreach (var ge in graph.Events)
                     narratives[ge.EventId] = await _svc.ClipDescriber.DescribeAsync(videoPath, Math.Max(0, ge.Temporal.StartS - 1), ge.Temporal.EndS + 1, "de", ct);
 
+            // Services that switched to their fallback during the run say so once.
+            foreach (var (name, svc) in new (string, object?)[] { ("ui", _svc.UiParser), ("grounder", _svc.Grounder), ("tracker", _svc.Tracker), ("describer", _svc.ClipDescriber) })
+                if (svc is Services.IReportsFallback rf) foreach (var note in rf.FallbackNotes) Log($"{name}: {note}");
+
             return new PipelineResult
             {
                 Graph = graph, Transcript = transcript, AudioRefs = audioRefs, VisualEvents = finalEvents,

@@ -265,12 +265,12 @@ static class Tests
         var graph = new EventGraphBuilder().Build(video, refs, [e], new CrossModalResolver().Resolve(refs, [e], new UiElementRegistry()), new UiElementRegistry());
         var result = new PipelineResult { Graph = graph, Transcript = tr, AudioRefs = refs, VisualEvents = [e], TimelineDe = "", TimelineEn = "" };
 
-        // The video path does not exist: a text-only article must not even try to read a frame from it.
-        var svc = new ArticleService();
+        // ffmpeg points nowhere: any attempt to read a frame would show up in the log as a failed start.
+        var svc = new ArticleService(ff: new FfmpegService { FfmpegPath = "__no_ffmpeg__", FfprobePath = "__no_ffprobe__" });
         var a = await svc.CreateAsync(result, "does-not-exist.mp4", new ArticleRequest(Private: true));
         Assert.True(a.Private && a.Steps.Count == 2, "private article with steps");
         Assert.True(a.Steps.All(s => s.ScreenshotJpeg is null && s.ScreenshotS is null && s.PointXyPx is null), "no screenshot, no click position");
-        Assert.True(!svc.Log.Any(l => l.Contains("screenshot")) || svc.Log.Any(l => l.Contains("no screenshots taken")), "no frame extraction");
+        Assert.True(!svc.Log.Any(l => l.Contains("__no_")), "no frame extraction: " + string.Join(" | ", svc.Log));
         var md = ArticleRenderer.Markdown(a);
         Assert.True(!md.Contains("![") && md.Contains("private") && !md.Contains("Müller") && !md.Contains("Beispiel AG"), "text only, no names");
         Assert.True(ArticlePackage.Files(a).Select(f => f.Path).SequenceEqual(["article.md"]), "package has no images");
@@ -420,8 +420,8 @@ static class Tests
         var diarized = OpenAiTranscriber.Parse("""{"text":"…","segments":[{"start":0,"end":3,"text":"Klicken Sie bitte hier auf das Menü und dann auf Speichern.","speaker":"A"}]}""", null);
         Assert.Eq("de", diarized.Language, "language recognised from the text");
         Assert.Eq("en", OpenAiTranscriber.GuessLanguage("Now you can click on the button and then it is saved."), "english");
-        var textOnly = OpenAiTranscriber.Parse("""{"text":"Klicken Sie hier."}""", "de", audioDurationS: 42.5);
-        Assert.Near(42.5, textOnly.Segments.Single().End, 1e-9, "text-only answer spans the recording");
+        try { _ = new OpenAiTranscriber("https://api.openai.com/v1", "gpt-4o-transcribe", "k", TimeSpan.FromSeconds(5)); throw new Exception("text-only model accepted"); }
+        catch (InvalidOperationException ex) { Assert.True(ex.Message.Contains("no timestamps"), "text-only model refused at configuration time"); }
     }
 
     [Test] public static void Restored_Step_Joins_The_Section_Before_It()
@@ -434,6 +434,67 @@ static class Tests
         ] };
         Assert.Eq(1, ArticleService.RestoreObservedSteps(draft, written), "restored");
         Assert.True(written.Steps.All(s => s.Section == "Option 1"), "no repeated section heading");
+    }
+
+    [Test] public static void Private_Videos_Use_Local_Services_Only()
+    {
+        var cfg = new AiServicesOptions
+        {
+            Asr = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1", ApiKey = "k", AlignUrl = "http://127.0.0.1:8011",
+                                       Fallback = new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011" } },
+            TextGenerator = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1",
+                                                 Fallback = new ServiceOptions { Provider = "ollama", Url = "http://192.168.1.20:11434/v1" } },
+            ClipDescriber = new ServiceOptions { Provider = "qwen-vl", Url = "https://vlm.example.com/v1" },
+        }.LocalOnly();
+        Assert.True(cfg.Asr.Provider == "whisperx" && cfg.Asr.Fallback is null, "speech recognition: local WhisperX only");
+        Assert.True(cfg.TextGenerator.Provider == "ollama", "language model: the local fallback");
+        Assert.True(cfg.ClipDescriber.IsOff, "no local describer → off");
+        Assert.True(new ServiceOptions { Provider = "whisperx-json", Path = "t.json" }.IsLocal, "a file is local");
+    }
+
+    [Test] public static void Fallbacks_Work_For_Every_Capability_And_Hide_Images_From_Text_Models()
+    {
+        var f = AiServiceFactory.CreateDefault();
+        var s = f.CreatePipelineServices(new AiServicesOptions
+        {
+            Grounder = new ServiceOptions { Provider = "molmo", Url = "http://127.0.0.1:8002", Fallback = new ServiceOptions { Provider = "qwen-vl", Url = "http://127.0.0.1:8005/v1" } },
+        });
+        Assert.True(s.Grounder is FallbackGrounder, "grounder fallback is used, not ignored");
+        Assert.True(f.TryCreateArticleWriter(new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "ollama", Url = "127.0.0.1:11434/v1" } }, out var problem) is null && problem is not null,
+            "a malformed URL is reported, not thrown");
+
+        var req = LlmArticleWriter.BuildRequest("de", [new Sentence(0, 2, "Klicken Sie auf Speichern.")], null, [new PromptImage("Bild 1", [1])]);
+        var textOnly = req.TextOnly();
+        Assert.True(req.User.Contains("Bilder") && textOnly.Images.Count == 0 && !textOnly.User.Contains("Bilder") && !textOnly.System.Contains("Bildern"),
+            "a text-only model gets a prompt without images");
+    }
+
+    [Test] public static void Unsolved_Or_Diagnostic_Clicks_Are_Not_Restored()
+    {
+        var draft = new WikiArticle { Title = "T", Language = "de", Steps =
+        [
+            new ArticleStep { Instruction = "Klicken Sie auf Info.", TimeS = 10, EndS = 12, PointXyPx = [1, 2] },
+            new ArticleStep { Instruction = "Klicken Sie auf Speichern.", TimeS = 40, EndS = 43, PointXyPx = [1, 2] },
+        ] };
+        WikiArticle Written(bool? resolved) => new() { Title = "T", Language = "de", Resolved = resolved, Steps = [new ArticleStep { Instruction = "A", TimeS = 30, EndS = 35 }] };
+        Assert.Eq(0, ArticleService.RestoreObservedSteps(draft, Written(false)), "unsolved: nothing restored");
+        Assert.Eq(0, ArticleService.RestoreObservedSteps(draft, new WikiArticle { Title = "T", Language = "de" }), "no steps: nothing restored");
+        var solved = Written(true);
+        Assert.Eq(1, ArticleService.RestoreObservedSteps(draft, solved), "only the click inside the solution");
+        Assert.True(!solved.Steps.Any(x => x.Instruction.Contains("Info")), "diagnosis before the solution stays out");
+
+        var tr = Call("de", (0.0, "SPEAKER_01", "Das Drucken geht nicht."), (3.0, "SPEAKER_00", "Klicken Sie auf Datei."), (6.0, "SPEAKER_01", "Die Meldung ist weg."));
+        Assert.True(new ArticleBuilder().Build(tr, new AudioRefParser().Parse(tr), null).Verification == "Die Meldung ist weg.", "'ist weg.' confirms");
+    }
+
+    [Test] public static void Article_Folder_Keeps_No_Old_Screenshots()
+    {
+        var dir = Directory.CreateTempSubdirectory("avag_pkg").FullName;
+        Directory.CreateDirectory(Path.Combine(dir, "images"));
+        File.WriteAllBytes(Path.Combine(dir, "images", "step-07.jpg"), [1]);
+        ArticlePackage.WriteTo(new WikiArticle { Title = "T", Language = "de", Steps = [new ArticleStep { Number = 1, Instruction = "A" }] }, dir);
+        Assert.True(!File.Exists(Path.Combine(dir, "images", "step-07.jpg")), "old screenshot removed");
+        Directory.Delete(dir, true);
     }
 
     [Test] public static void Sidecar_Json_Is_Read_As_Snake_Case()

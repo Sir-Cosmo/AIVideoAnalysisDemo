@@ -14,8 +14,10 @@ namespace AvAg.Pipeline.Adapters;
 /// <item><c>gpt-4o-transcribe-diarize</c> (default): best text plus speaker labels (customer / supporter), times per
 /// segment.</item>
 /// <item><c>whisper-1</c>: times per word, no speaker labels.</item>
-/// <item>other models (<c>gpt-4o-transcribe</c>, …): text only – need <c>AlignUrl</c> for times.</item>
 /// </list>
+/// Text-only models (<c>gpt-4o-transcribe</c>, <c>gpt-4o-mini-transcribe</c>) are refused: without times per segment the
+/// spoken instructions cannot be tied to the clicks. gpt-4o models accept at most 1400 s (diarize) / 1500 s of audio;
+/// a longer recording is refused before the upload, so the fallback (local WhisperX) takes over at no cost.
 /// The diarize model reports no language: without a language hint it is recognised from the text (German or English).
 /// Word times matter: they tie "klicken Sie hier" to the click on screen. With an <c>AlignUrl</c> (the local WhisperX
 /// sidecar's POST /align) the cloud transcript is aligned to exact word times locally; otherwise words are spread
@@ -38,6 +40,8 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
     {
         _endpoint = new Uri(baseUrl.TrimEnd('/') + "/audio/transcriptions");
         _model = string.IsNullOrWhiteSpace(model) ? DefaultModel : model;
+        if (!Diarize && !WordTimes)
+            throw new InvalidOperationException($"OpenAI model {_model} returns no timestamps – use {DefaultModel} or whisper-1");
         _apiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey;
         _prompt = string.IsNullOrWhiteSpace(prompt) ? null : prompt;
         _alignUrl = string.IsNullOrWhiteSpace(alignUrl) ? null : alignUrl.TrimEnd('/') + "/";
@@ -52,10 +56,14 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
 
     private bool Diarize => _model.Contains("diarize", StringComparison.OrdinalIgnoreCase);
     private bool WordTimes => _model.StartsWith("whisper", StringComparison.OrdinalIgnoreCase);
+    /// <summary>Longest audio the model accepts (OpenAI: "audio duration … is longer than 1400 seconds"); null = no limit.</summary>
+    private double? MaxDurationS => Diarize ? 1400 : _model.StartsWith("gpt-4o", StringComparison.OrdinalIgnoreCase) ? 1500 : null;
 
     public async Task<Transcript> TranscribeAsync(string audioWavPath, string? languageHint, bool diarize, CancellationToken ct = default)
     {
         if (_apiKey is null) throw new InvalidOperationException("OpenAI speech recognition needs an API key (Services:Asr:ApiKey).");
+        if (MaxDurationS is { } max && WavDurationS(audioWavPath) is { } dur && dur > max)
+            throw new InvalidOperationException($"the recording is {dur / 60:0} min long; {_model} accepts at most {max / 60:0.#} min");
         var mp3 = Path.Combine(Path.GetTempPath(), $"avag_asr_{Guid.NewGuid():N}.mp3");
         try
         {
@@ -65,15 +73,12 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
                 throw new InvalidOperationException("the recording is too long for one OpenAI transcription request (25 MB)");
 
             var body = await PostAsync(mp3, languageHint, ct);
-            var wx = Parse(body, languageHint, WavDurationS(audioWavPath));
-            bool timed = WordTimes || Diarize;   // text-only models give one segment over the whole call
-            if (!timed && _alignUrl is null)
-                throw new InvalidOperationException($"{_model} returns no timestamps – use {DefaultModel} or whisper-1, or set AlignUrl");
+            var wx = Parse(body, languageHint);
             if (_alignUrl is not null && wx.Segments.Count > 0)
             {
-                // For timed models exact word times are a refinement: without the local aligner the transcript is still used.
+                // Exact word times are a refinement: without the local aligner the transcript is still used.
                 try { wx = await AlignAsync(audioWavPath, wx, ct); }
-                catch (Exception ex) when (timed && (ex is not OperationCanceledException || !ct.IsCancellationRequested))
+                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
                 {
                     _notes.Add($"word alignment not available ({ex.Message.Split('\n')[0]}) – word times estimated per segment");
                 }
@@ -115,11 +120,10 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
 
     /// <summary>
     /// Any of the three answer shapes → WhisperX JSON. Diarized segments get "SPEAKER_A"-style labels and words without
-    /// times (spread over the segment later); verbose_json words are assigned to their segments by time. A text-only
-    /// answer becomes one segment over <paramref name="audioDurationS"/> (the aligner needs the real span). Without a
+    /// times (spread over the segment later); verbose_json words are assigned to their segments by time. Without a
     /// reported language or a hint, the language is recognised from the text.
     /// </summary>
-    public static WhisperXJson Parse(string body, string? languageHint, double? audioDurationS = null)
+    public static WhisperXJson Parse(string body, string? languageHint)
     {
         JsonNode j;
         try { j = JsonNode.Parse(body) ?? throw new InvalidOperationException("empty answer"); }
@@ -149,7 +153,7 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
         }
         else if (j["text"]?.GetValue<string>() is { Length: > 0 } all)
         {
-            double end = words.Count > 0 ? words[^1].End ?? 0 : Num(j["duration"]) ?? audioDurationS ?? 0;
+            double end = words.Count > 0 ? words[^1].End ?? 0 : Num(j["duration"]) ?? 0;
             wx.Segments.Add(new WhisperXSegment
             {
                 Start = 0, End = end, Text = all.Trim(),

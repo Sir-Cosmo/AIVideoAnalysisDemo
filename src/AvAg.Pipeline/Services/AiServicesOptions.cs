@@ -47,6 +47,39 @@ public sealed class ServiceOptions
     /// <summary>Nothing configured at all.</summary>
     public bool IsEmpty => string.IsNullOrWhiteSpace(Provider) && string.IsNullOrWhiteSpace(Url) && string.IsNullOrWhiteSpace(Path);
 
+    /// <summary>Runs on this machine or in the local network: a file, or a URL on a loopback / private address.
+    /// Only such services may see a private video.</summary>
+    public bool IsLocal => !string.IsNullOrWhiteSpace(Path) && string.IsNullOrWhiteSpace(Url) || IsLocalUrl(Url);
+
+    public static bool IsLocalUrl(string? url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u)) return false;
+        if (u.IsLoopback || u.Host.EndsWith(".local", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!System.Net.IPAddress.TryParse(u.Host, out var ip)) return false;
+        if (ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal || ip.IsIPv6UniqueLocal) return true;
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+        var b = ip.GetAddressBytes();
+        return b[0] == 10 || b[0] == 172 && b[1] is >= 16 and <= 31 || b[0] == 192 && b[1] == 168 || b[0] == 169 && b[1] == 254;
+    }
+
+    /// <summary>This chain without the services that are not <see cref="IsLocal"/> (an alignment URL elsewhere is dropped
+    /// too); <see cref="Off"/> if none is left.</summary>
+    public ServiceOptions LocalOnly()
+    {
+        if (IsOff) return Clone();
+        ServiceOptions? head = null, tail = null;
+        foreach (var o in WithFallbacks().Where(x => !x.IsEmpty && x.IsLocal))
+        {
+            var c = (ServiceOptions)o.MemberwiseClone();
+            c.Fallback = null;
+            if (!IsLocalUrl(c.AlignUrl)) c.AlignUrl = null;
+            if (head is null) head = c; else tail!.Fallback = c;
+            tail = c;
+        }
+        return head ?? (IsEmpty ? Clone() : Off());
+    }
+
     public TimeSpan TimeoutOr(TimeSpan fallback) => TimeoutSeconds is > 0 and var s ? TimeSpan.FromSeconds(s) : fallback;
 
     public ServiceOptions Clone()
@@ -122,6 +155,14 @@ public sealed class AiServicesOptions
 
     /// <summary>Every configured service including fallbacks – for starting local sidecars.</summary>
     public IEnumerable<ServiceOptions> All => Primaries.SelectMany(o => o.WithFallbacks());
+
+    /// <summary>For private videos: every capability restricted to services on this machine or in the local network.
+    /// Cloud services (OpenAI, …) are dropped from each chain; a capability with no local service is off.</summary>
+    public AiServicesOptions LocalOnly() => new()
+    {
+        Asr = EffectiveAsr.LocalOnly(), UiParser = UiParser.LocalOnly(), Grounder = Grounder.LocalOnly(),
+        Tracker = Tracker.LocalOnly(), ClipDescriber = ClipDescriber.LocalOnly(), TextGenerator = TextGenerator.LocalOnly(),
+    };
 
     /// <summary>
     /// A copy with this run's overrides – the single place where the web page and the CLI change the configuration.

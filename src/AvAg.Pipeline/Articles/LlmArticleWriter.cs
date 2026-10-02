@@ -50,28 +50,29 @@ public sealed class LlmArticleWriter : IArticleWriter, Services.IReportsFallback
             transcript.Append(CultureInfo.InvariantCulture,
                 $"[{i + 1}] ({ArticleRenderer.Ts(sentences[i].StartS)}) {(sentences[i].Speaker is { } sp ? sp + ": " : "")}{sentences[i].Text}\n");
 
+        bool images = screens.Count > 0;
         string system = de
-            ? """
+            ? $"""
               Du bist erfahrene technische Redakteurin im Kundensupport eines Softwareherstellers. Du bekommst einen aufgezeichneten Support-Anruf: Ein Kunde schildert ein Problem, ein Supporter löst es, meist per Bildschirmfreigabe oder Fernwartung.
               Daraus schreibst du einen Artikel für die Wissensdatenbank (Wiki), mit dem ein anderer Kunde dasselbe Problem künftig ohne Anruf selbst lösen kann.
               - Schreibe sachlich und präzise auf Deutsch, in der Sie-Form, allgemein gültig – keine Nacherzählung des Gesprächs.
-              - Erfinde nichts. Verwende nur, was im Gespräch gesagt oder auf den Bildern zu sehen ist.
-              - KEINE personenbezogenen Daten – auch nicht, wenn sie auf den Bildern zu sehen sind: keine Namen von Personen oder Firmen des Kunden, keine Telefonnummern, E-Mail-Adressen, Kunden-, Lizenz-, Vertrags- oder Belegnummern, Adressen, Passwörter. Schreibe allgemein („Ihre Kundennummer“).
+              - Erfinde nichts. Verwende nur, was im Gespräch gesagt{(images ? " oder auf den Bildern zu sehen" : "")} ist.
+              - KEINE personenbezogenen Daten{(images ? " – auch nicht, wenn sie auf den Bildern zu sehen sind" : "")}: keine Namen von Personen oder Firmen des Kunden, keine Telefonnummern, E-Mail-Adressen, Kunden-, Lizenz-, Vertrags- oder Belegnummern, Adressen, Passwörter. Schreibe allgemein („Ihre Kundennummer“).
               - Programm-, Menü-, Register- und Schaltflächennamen sowie Fehlermeldungen übernimmst du wörtlich und in Anführungszeichen („Speichern“).
               """
-            : """
+            : $"""
               You are an experienced technical writer in the customer support of a software company. You get a recorded support call: a customer describes a problem and a supporter solves it, usually via screen sharing or remote control.
               From it you write a knowledge-base (wiki) article that lets another customer solve the same problem themselves, without calling.
               - Write factually and precisely in English, addressed to the reader ("you"), generally valid – not a retelling of the call.
-              - Do not invent anything. Use only what is said in the call or visible in the images.
-              - NO personal data – not even if it is visible in the images: no names of people or of the customer's company, no phone numbers, e-mail addresses, customer, licence, contract or document numbers, addresses, passwords. Write generally ("your customer number").
+              - Do not invent anything. Use only what is said in the call{(images ? " or visible in the images" : "")}.
+              - NO personal data{(images ? " – not even if it is visible in the images" : "")}: no names of people or of the customer's company, no phone numbers, e-mail addresses, customer, licence, contract or document numbers, addresses, passwords. Write generally ("your customer number").
               - Keep program, menu, tab and button names and error messages exactly as they are, in quotation marks ("Save").
               """;
         string rules = de
-            ? """
+            ? $"""
               Regeln:
               - Zeilen können mit einem Sprecher-Label beginnen (SPEAKER_A, SPEAKER_00 …). Ohne Label erkennst du am Inhalt, wer Kunde und wer Supporter ist. Wenn der Supporter per Fernwartung selbst klickt, beschreibst du es als Schritt, den der Kunde ausführt.
-              - "problem": was der Kunde erlebt (Symptome, in welchem Programmteil, wann), allgemein formuliert. "error_messages": Fehlermeldungen wörtlich (aus dem Gespräch oder von den Bildern).
+              - "problem": was der Kunde erlebt (Symptome, in welchem Programmteil, wann), allgemein formuliert. "error_messages": Fehlermeldungen wörtlich (aus dem Gespräch{(images ? " oder von den Bildern" : "")}).
               - "cause": die Ursache, wenn sie im Gespräch klar wird, sonst null. "applies_to": Produkt/Modul/Version, falls genannt oder sichtbar, sonst null.
               - "steps": NUR der Weg, der das Problem am Ende gelöst hat, in der Reihenfolge, wie der Kunde ihn selbst ausführt – GENAU EINE Handlung pro Schritt, kurzer Imperativsatz („Klicken Sie …“). Lass Fehlversuche, Rückfragen und Diagnose weg, die nicht zur Lösung gehören. Nenne Menüpfade vollständig („Datei › Einstellungen › Profil“), Tastenkombinationen als "Strg + C". Statt „hier“ oder „dort“ nennst du das Element – der Leser sieht das Video nicht.
               - "details": was danach auf dem Bildschirm passiert oder was man beachten muss – nur wenn bekannt, sonst null.
@@ -81,10 +82,10 @@ public sealed class LlmArticleWriter : IArticleWriter, Services.IReportsFallback
               - "verification": woran man erkennt, dass das Problem gelöst ist. "notes": Hinweise, z. B. wann man trotzdem den Support kontaktieren sollte.
               - "keywords": 3–8 Suchbegriffe, wie ein Kunde sie eintippen würde (inkl. Fehlermeldung). "resolved": ob das Problem im Gespräch gelöst wurde.
               """
-            : """
+            : $"""
               Rules:
               - Lines may start with a speaker label (SPEAKER_A, SPEAKER_00 …). Without labels, tell customer and supporter apart by what they say. If the supporter clicks via remote control, write it as a step the customer performs.
-              - "problem": what the customer experiences (symptoms, where in the program, when), written generally. "error_messages": error messages verbatim (from the call or from the images).
+              - "problem": what the customer experiences (symptoms, where in the program, when), written generally. "error_messages": error messages verbatim (from the call{(images ? " or from the images" : "")}).
               - "cause": the cause if the call makes it clear, otherwise null. "applies_to": product/module/version if mentioned or visible, otherwise null.
               - "steps": ONLY the way that finally solved the problem, in the order the customer would do it – EXACTLY ONE action per step, one short imperative sentence ("Click …"). Leave out failed attempts, questions and diagnosis that are not part of the solution. Give menu paths in full ("File › Settings › Profile"), key combinations as "Ctrl + C". Instead of "here" or "there", name the element – the reader does not see the video.
               - "details": what happens on screen afterwards or what to watch out for – only if known, otherwise null.
@@ -115,7 +116,12 @@ public sealed class LlmArticleWriter : IArticleWriter, Services.IReportsFallback
              "steps": [{"section": null, "title": "{{(de ? "kurze Handlung" : "short action")}}", "instruction": "{{(de ? "Klicken Sie …" : "Click …")}}", "details": null, "actor": "customer", "sentences": [1]}],
              "verification": null, "notes": [], "keywords": [], "resolved": true}
             """;
-        return new TextGenerationRequest(system, user, Json: true, MaxTokens: 4000, Temperature: 0.2) { Images = screens };
+        return new TextGenerationRequest(system, user, Json: true, MaxTokens: 4000, Temperature: 0.2)
+        {
+            Images = screens,
+            // For a fallback model that cannot read images: the same prompt without them.
+            WithoutImages = images ? BuildRequest(language, sentences, observedActions, []) : null,
+        };
     }
 
     // ---- answer ------------------------------------------------------------------------------------------------------

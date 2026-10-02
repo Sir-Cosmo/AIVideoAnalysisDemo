@@ -136,7 +136,7 @@
         <input type="file" name="ui_json" accept=".json">
       </label>
 
-      <label class="field full private"><span><input type="checkbox" name="private" value="true" id="privateUpload"> Private video — the article is text only, no screenshots are taken from the video</span></label>
+      <label class="field full private"><span><input type="checkbox" name="private" value="true" id="privateUpload"> Private video — only local services (no OpenAI), the article is text only, no screenshots are taken from the video</span></label>
 
       <details class="advanced">
         <summary>Services and analysis settings</summary>
@@ -209,7 +209,7 @@
     <h2>Wiki article — problem, cause and solution from the call</h2>
     <div class="article-bar">
       <label>Language <select id="articleLang"><option value="">Same as spoken</option><option value="de">German</option><option value="en">English</option></select></label>
-      <label title="No frame of the video is extracted; the article only explains in text"><input type="checkbox" id="articlePrivate"> Private — text only, no screenshots</label>
+      <label title="No frame of the video is extracted and only a local language model is used; the article only explains in text"><input type="checkbox" id="articlePrivate"> Private — text only, no screenshots, local model only</label>
       <label id="llmLabel" class="hidden"><input type="checkbox" id="articleLlm" checked> Write with <span id="llmName"></span></label>
       <button class="btn" id="makeArticle" type="button">Create wiki article</button>
       <span class="note" id="articleNote"></span>

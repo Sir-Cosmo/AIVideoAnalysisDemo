@@ -31,33 +31,53 @@ public sealed class SidecarLauncher : IHostedService, IDisposable
     /// usable immediately, and a job waits for the services it needs (<see cref="EnsureReadyAsync"/>).</summary>
     public async Task StartAsync(CancellationToken ct)
     {
-        foreach (var o in _settings.Services.All)
+        foreach (var (o, _) in Sidecars(_settings.Services))
             if (IsManaged(o, out var uri)) await StartIfNeededAsync(o, uri, ct);
     }
 
     /// <summary>
-    /// Before a job: (re)starts every managed sidecar the job uses and waits until each configured (primary) service
-    /// accepts connections. Fallback sidecars are only started, never waited for: a broken or slowly loading fallback
-    /// must not hold up or fail a job whose primary service works – if the fallback is needed, its own error is reported.
+    /// Before a job: (re)starts every managed sidecar the job uses – primaries, fallbacks and the local WhisperX that aligns
+    /// a cloud transcript – and waits until each accepts connections. Only a primary that cannot start fails the job: a
+    /// fallback or aligner that exits or does not come up is reported and the job goes on without it.
     /// </summary>
     public async Task EnsureReadyAsync(AiServicesOptions services, Action<string> progress, CancellationToken ct)
     {
-        foreach (var primary in services.Primaries)
-        foreach (var o in primary.WithFallbacks())
+        foreach (var (o, required) in Sidecars(services))
         {
             if (!IsManaged(o, out var uri) || await IsListeningAsync(uri, ct)) continue;
-            bool isFallback = !ReferenceEquals(o, primary);
-            progress(isFallback ? $"starting the {o.LocalModule} sidecar (fallback) in the background…" : $"starting the {o.LocalModule} sidecar…");
+            progress($"starting the {o.LocalModule} sidecar…");
             await StartIfNeededAsync(o, uri, ct);
-            if (isFallback || !_byPort.TryGetValue(uri.Port, out var p)) continue; // could not be started – the job reports the connection error
+            if (!_byPort.TryGetValue(uri.Port, out var p)) continue; // could not be started – the job reports the connection error
             var deadline = DateTime.UtcNow + ReadyTimeout;
             while (!await IsListeningAsync(uri, ct))
             {
-                if (p.HasExited) throw new InvalidOperationException($"The {o.LocalModule} sidecar exited (code {p.ExitCode}); see {LogName(o)} in the sidecars folder.");
-                if (DateTime.UtcNow > deadline) throw new TimeoutException($"The {o.LocalModule} sidecar did not start within {ReadyTimeout.TotalMinutes:0} min.");
+                string? problem = p.HasExited ? $"The {o.LocalModule} sidecar exited (code {p.ExitCode}); see {LogName(o)} in the sidecars folder."
+                                : DateTime.UtcNow > deadline ? $"The {o.LocalModule} sidecar did not start within {ReadyTimeout.TotalMinutes:0} min." : null;
+                if (problem is not null)
+                {
+                    if (required) throw new InvalidOperationException(problem);
+                    progress(problem + " Continuing without it.");
+                    break;
+                }
                 await Task.Delay(1000, ct);
             }
         }
+    }
+
+    /// <summary>Every service of every capability (primary = required) plus a local alignment URL of speech recognition,
+    /// which is the WhisperX sidecar too. Each port once, a required entry first.</summary>
+    private static IEnumerable<(ServiceOptions Options, bool Required)> Sidecars(AiServicesOptions services)
+    {
+        var all = new List<(ServiceOptions, bool)>();
+        foreach (var primary in services.Primaries)
+            foreach (var o in primary.WithFallbacks())
+            {
+                all.Add((o, ReferenceEquals(o, primary)));
+                if (!string.IsNullOrWhiteSpace(o.AlignUrl))
+                    all.Add((new ServiceOptions { Provider = "whisperx", Url = o.AlignUrl, LocalModule = AiServicesOptions.LocalAsrModule }, false));
+            }
+        return all.OrderByDescending(x => x.Item2)
+                  .DistinctBy(x => Uri.TryCreate(x.Item1.Url, UriKind.Absolute, out var u) && x.Item1.LocalModule is not null ? $"{u.Host}:{u.Port}" : Guid.NewGuid().ToString());
     }
 
     private bool IsManaged(ServiceOptions o, out Uri uri)
