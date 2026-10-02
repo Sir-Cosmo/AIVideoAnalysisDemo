@@ -71,7 +71,7 @@ public sealed class ArticleService
                 // Images are a help, not a requirement: without them the model still writes from the text.
                 try
                 {
-                    var screens = await _screenshots.KeyframesAsync(videoPath, result.Graph, ct);
+                    var screens = await _screenshots.KeyframesAsync(videoPath, result.Graph, ct, thumbnails: result.Thumbnails);
                     input = input with { Screens = screens };
                     Add($"{screens.Count} screen images sent to the language model");
                 }
@@ -135,7 +135,7 @@ public sealed class ArticleService
         if (missing.Count == 0) return 0;
         var restored = missing.Select(d =>
         {
-            var before = written.Steps.Where(w => w.TimeS <= d.TimeS).MaxBy(w => w.TimeS) ?? written.Steps.MinBy(w => w.TimeS);
+            var before = written.Steps.Where(w => w.TimeS <= d.TimeS).MaxBy(w => w.TimeS);
             return new ArticleStep
             {
                 Title = d.Title, Instruction = d.Instruction, Details = d.Details, TimeS = d.TimeS, EndS = d.EndS,
@@ -147,11 +147,20 @@ public sealed class ArticleService
         return missing.Count;
     }
 
-    /// <summary>Draft steps with an observed click whose narration no step of the model's article covers.</summary>
-    public static List<ArticleStep> MissingObservedSteps(WikiArticle draft, WikiArticle written) => draft.Steps
-        .Where(d => d.PointXyPx is not null)
-        .Where(d => !written.Steps.Any(w => w.TimeS < d.EndS && d.TimeS < Math.Max(w.EndS, w.TimeS + 0.01)))
-        .ToList();
+    /// <summary>
+    /// Draft steps with an observed click whose narration no step of the model's article covers. Only gaps in a solution:
+    /// nothing when the model found no solution (no steps, or not resolved), and nothing before its first step – clicks
+    /// there are diagnosis or failed attempts, which the model is told to leave out.
+    /// </summary>
+    public static List<ArticleStep> MissingObservedSteps(WikiArticle draft, WikiArticle written)
+    {
+        if (written.Steps.Count == 0 || written.Resolved == false) return [];
+        double solutionStart = written.Steps.Min(w => w.TimeS);
+        return draft.Steps
+            .Where(d => d.PointXyPx is not null && d.TimeS >= solutionStart)
+            .Where(d => !written.Steps.Any(w => w.TimeS < d.EndS && d.TimeS < Math.Max(w.EndS, w.TimeS + 0.01)))
+            .ToList();
+    }
 
     private void Add(string message) => Log.Add("article: " + message);
 }

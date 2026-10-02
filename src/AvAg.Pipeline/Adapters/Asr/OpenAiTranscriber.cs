@@ -14,8 +14,13 @@ namespace AvAg.Pipeline.Adapters;
 /// <item><c>gpt-4o-transcribe-diarize</c> (default): best text plus speaker labels (customer / supporter), times per
 /// segment.</item>
 /// <item><c>whisper-1</c>: times per word, no speaker labels.</item>
-/// <item>other models (<c>gpt-4o-transcribe</c>, …): text only – need <c>AlignUrl</c> for times.</item>
 /// </list>
+/// Text-only models (<c>gpt-4o-transcribe</c>, <c>gpt-4o-mini-transcribe</c>) are refused: without times per segment the
+/// spoken instructions cannot be tied to the clicks.
+/// gpt-4o models accept at most 1400 s (diarize) / 1500 s of audio per request. A longer call is cut at pauses into
+/// parts of about 20 min; the first part is transcribed alone, and its speakers are passed to the other parts as known
+/// speakers (a few seconds of each voice), so "SPEAKER_A" is the same person in the whole call. The other parts run in
+/// parallel.
 /// The diarize model reports no language: without a language hint it is recognised from the text (German or English).
 /// Word times matter: they tie "klicken Sie hier" to the click on screen. With an <c>AlignUrl</c> (the local WhisperX
 /// sidecar's POST /align) the cloud transcript is aligned to exact word times locally; otherwise words are spread
@@ -38,6 +43,8 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
     {
         _endpoint = new Uri(baseUrl.TrimEnd('/') + "/audio/transcriptions");
         _model = string.IsNullOrWhiteSpace(model) ? DefaultModel : model;
+        if (!Diarize && !WordTimes)
+            throw new InvalidOperationException($"OpenAI model {_model} returns no timestamps – use {DefaultModel} or whisper-1");
         _apiKey = string.IsNullOrWhiteSpace(apiKey) ? null : apiKey;
         _prompt = string.IsNullOrWhiteSpace(prompt) ? null : prompt;
         _alignUrl = string.IsNullOrWhiteSpace(alignUrl) ? null : alignUrl.TrimEnd('/') + "/";
@@ -52,38 +59,116 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
 
     private bool Diarize => _model.Contains("diarize", StringComparison.OrdinalIgnoreCase);
     private bool WordTimes => _model.StartsWith("whisper", StringComparison.OrdinalIgnoreCase);
+    /// <summary>Longest audio the model accepts (OpenAI: "audio duration … is longer than 1400 seconds"); null = no limit.</summary>
+    private double? MaxDurationS => MaxRequestSeconds ?? (Diarize ? 1400 : _model.StartsWith("gpt-4o", StringComparison.OrdinalIgnoreCase) ? 1500 : null);
+
+    /// <summary>Longest audio per request; null = the model's limit. For tests and new models.</summary>
+    public double? MaxRequestSeconds { get; init; }
 
     public async Task<Transcript> TranscribeAsync(string audioWavPath, string? languageHint, bool diarize, CancellationToken ct = default)
     {
         if (_apiKey is null) throw new InvalidOperationException("OpenAI speech recognition needs an API key (Services:Asr:ApiKey).");
+        double? duration = WavDurationS(audioWavPath);
+        var wx = MaxDurationS is { } max && duration is { } dur && dur > max
+            ? await TranscribeInPartsAsync(audioWavPath, dur, max, languageHint, ct)
+            : Parse(await TranscribeSpanAsync(audioWavPath, null, null, languageHint, [], ct), languageHint);
+        if (_alignUrl is not null && wx.Segments.Count > 0)
+        {
+            // Exact word times are a refinement: without the local aligner the transcript is still used.
+            try { wx = await AlignAsync(audioWavPath, wx, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+            {
+                _notes.Add($"word alignment not available ({ex.Message.Split('\n')[0]}) – word times estimated per segment");
+            }
+        }
+        return WhisperXMapper.ToTranscript(wx);
+    }
+
+    /// <summary>One request for [<paramref name="startS"/>, <paramref name="endS"/>] of the recording (null = all of it).</summary>
+    private async Task<string> TranscribeSpanAsync(string wav, double? startS, double? endS, string? language,
+                                                   IReadOnlyList<(string Name, string DataUrl)> speakers, CancellationToken ct)
+    {
         var mp3 = Path.Combine(Path.GetTempPath(), $"avag_asr_{Guid.NewGuid():N}.mp3");
         try
         {
-            await _ff.EncodeMp3Async(audioWavPath, mp3, 32, ct);
-            if (new FileInfo(mp3).Length > MaxUploadBytes) await _ff.EncodeMp3Async(audioWavPath, mp3, 16, ct);
+            await _ff.EncodeMp3Async(wav, mp3, 32, ct, startS, endS);
+            if (new FileInfo(mp3).Length > MaxUploadBytes) await _ff.EncodeMp3Async(wav, mp3, 16, ct, startS, endS);
             if (new FileInfo(mp3).Length > MaxUploadBytes)
                 throw new InvalidOperationException("the recording is too long for one OpenAI transcription request (25 MB)");
-
-            var body = await PostAsync(mp3, languageHint, ct);
-            var wx = Parse(body, languageHint, WavDurationS(audioWavPath));
-            bool timed = WordTimes || Diarize;   // text-only models give one segment over the whole call
-            if (!timed && _alignUrl is null)
-                throw new InvalidOperationException($"{_model} returns no timestamps – use {DefaultModel} or whisper-1, or set AlignUrl");
-            if (_alignUrl is not null && wx.Segments.Count > 0)
-            {
-                // For timed models exact word times are a refinement: without the local aligner the transcript is still used.
-                try { wx = await AlignAsync(audioWavPath, wx, ct); }
-                catch (Exception ex) when (timed && (ex is not OperationCanceledException || !ct.IsCancellationRequested))
-                {
-                    _notes.Add($"word alignment not available ({ex.Message.Split('\n')[0]}) – word times estimated per segment");
-                }
-            }
-            return WhisperXMapper.ToTranscript(wx);
+            return await PostAsync(mp3, language, speakers, ct);
         }
         finally { try { File.Delete(mp3); } catch { /* best effort */ } }
     }
 
-    private async Task<string> PostAsync(string mp3, string? language, CancellationToken ct)
+    /// <summary>
+    /// A call longer than one request allows: parts cut at pauses, the first transcribed alone, the rest in parallel with
+    /// the first part's voices as known speakers. Times are shifted back onto the whole recording.
+    /// </summary>
+    private async Task<WhisperXJson> TranscribeInPartsAsync(string wav, double duration, double maxS, string? language, CancellationToken ct)
+    {
+        var parts = SplitAtPauses(duration, maxS, await _ff.DetectSilencesAsync(wav, ct: ct));
+        var first = Parse(await TranscribeSpanAsync(wav, parts[0].Start, parts[0].End, language, [], ct), language);
+        language ??= first.Language;
+        var speakers = Diarize ? await SpeakerSamplesAsync(wav, first, parts[0].Start, ct) : [];
+        var rest = await Task.WhenAll(parts.Skip(1).Select(async p =>
+            (p.Start, Wx: Parse(await TranscribeSpanAsync(wav, p.Start, p.End, language, speakers, ct), language))));
+
+        var all = new WhisperXJson { Language = first.Language };
+        foreach (var (offset, part) in rest.Prepend((parts[0].Start, first)))
+            foreach (var seg in part.Segments)
+            {
+                seg.Start += offset; seg.End += offset;
+                foreach (var w in seg.Words) { w.Start += offset; w.End += offset; }
+                all.Segments.Add(seg);
+            }
+        _notes.Add($"{duration / 60:0} min call transcribed in {parts.Count} parts" +
+                   (speakers.Count > 0 ? $" with {speakers.Count} known speakers carried across" : ""));
+        return all;
+    }
+
+    /// <summary>Parts of at most <paramref name="maxS"/> minus a safety margin, each ending in the longest pause in its
+    /// last quarter (no word is cut in half there); without a pause, at the limit.</summary>
+    public static List<(double Start, double End)> SplitAtPauses(double duration, double maxS, IReadOnlyList<(double StartS, double EndS)> silences)
+    {
+        double target = Math.Max(60, maxS - 120);
+        var parts = new List<(double, double)>();
+        double start = 0;
+        while (duration - start > target)
+        {
+            double limit = start + target;
+            var pause = silences.Where(s => (s.StartS + s.EndS) / 2 > start + 0.75 * target && (s.StartS + s.EndS) / 2 < limit)
+                                .OrderByDescending(s => s.EndS - s.StartS).FirstOrDefault();
+            double cut = pause == default ? limit : (pause.StartS + pause.EndS) / 2;
+            parts.Add((start, cut));
+            start = cut;
+        }
+        parts.Add((start, duration));
+        return parts;
+    }
+
+    /// <summary>For up to four speakers of the first part: one clear stretch of 3–10 s of their voice, as a data URL.</summary>
+    private async Task<List<(string Name, string DataUrl)>> SpeakerSamplesAsync(string wav, WhisperXJson part, double offset, CancellationToken ct)
+    {
+        var picks = part.Segments.Where(s => s.Speaker is not null && s.End - s.Start >= 3)
+            .GroupBy(s => s.Speaker!).Take(4)
+            .Select(g => (Name: g.Key.Replace("SPEAKER_", ""), Seg: g.OrderBy(s => Math.Abs(s.End - s.Start - 6)).First()))
+            .ToList();
+        var result = new List<(string, string)>();
+        foreach (var (name, seg) in picks)
+        {
+            var mp3 = Path.Combine(Path.GetTempPath(), $"avag_spk_{Guid.NewGuid():N}.mp3");
+            try
+            {
+                double s = offset + seg.Start, e = Math.Min(offset + seg.End, s + 10);
+                await _ff.EncodeMp3Async(wav, mp3, 64, ct, s, e);
+                result.Add((name, "data:audio/mpeg;base64," + Convert.ToBase64String(await File.ReadAllBytesAsync(mp3, ct))));
+            }
+            finally { try { File.Delete(mp3); } catch { /* best effort */ } }
+        }
+        return result;
+    }
+
+    private async Task<string> PostAsync(string mp3, string? language, IReadOnlyList<(string Name, string DataUrl)> speakers, CancellationToken ct)
     {
         using var form = new MultipartFormDataContent();
         var file = new ByteArrayContent(await File.ReadAllBytesAsync(mp3, ct));
@@ -95,6 +180,11 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
         {
             form.Add(new StringContent("diarized_json"), "response_format");
             form.Add(new StringContent("auto"), "chunking_strategy");   // required for recordings longer than 30 s
+            foreach (var (name, dataUrl) in speakers)
+            {
+                form.Add(new StringContent(name), "known_speaker_names[]");
+                form.Add(new StringContent(dataUrl), "known_speaker_references[]");
+            }
         }
         else if (WordTimes)
         {
@@ -115,11 +205,10 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
 
     /// <summary>
     /// Any of the three answer shapes → WhisperX JSON. Diarized segments get "SPEAKER_A"-style labels and words without
-    /// times (spread over the segment later); verbose_json words are assigned to their segments by time. A text-only
-    /// answer becomes one segment over <paramref name="audioDurationS"/> (the aligner needs the real span). Without a
+    /// times (spread over the segment later); verbose_json words are assigned to their segments by time. Without a
     /// reported language or a hint, the language is recognised from the text.
     /// </summary>
-    public static WhisperXJson Parse(string body, string? languageHint, double? audioDurationS = null)
+    public static WhisperXJson Parse(string body, string? languageHint)
     {
         JsonNode j;
         try { j = JsonNode.Parse(body) ?? throw new InvalidOperationException("empty answer"); }
@@ -149,7 +238,7 @@ public sealed class OpenAiTranscriber : IAsrService, Services.IReportsFallback
         }
         else if (j["text"]?.GetValue<string>() is { Length: > 0 } all)
         {
-            double end = words.Count > 0 ? words[^1].End ?? 0 : Num(j["duration"]) ?? audioDurationS ?? 0;
+            double end = words.Count > 0 ? words[^1].End ?? 0 : Num(j["duration"]) ?? 0;
             wx.Segments.Add(new WhisperXSegment
             {
                 Start = 0, End = end, Text = all.Trim(),

@@ -59,7 +59,7 @@ public sealed class OpenAiCompatibleTextGenerator : ITextGenerator
             string error = HttpServiceClient.ErrorMessage(text);
             Shape? adapted = status == 400 && attempt < 4 ? Adapt(shape, error) : null;
             if (adapted is null || adapted == shape)
-                throw new HttpRequestException($"{Name}: HTTP {status}: {error}");
+                throw new HttpRequestException($"{Name}: HTTP {status}: {error}", null, (System.Net.HttpStatusCode)status);
             shape = adapted;
         }
     }

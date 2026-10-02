@@ -6,7 +6,8 @@ POST /align {"audio_path": "...wav", "language": "de", "segments": [{start,end,t
 → the same JSON with word times – aligns a transcript from another recogniser (e.g. OpenAI) to the audio.
 
 Run:  uvicorn whisperx_server:app --host 127.0.0.1 --port 8011
-Env:  AVAG_WHISPER_MODEL=large-v3 (default: large-v3 on GPUs with >= 8 GB, else medium)  HF_TOKEN=<token for pyannote diarization models>
+Env:  AVAG_WHISPER_MODEL=large-v3 (default: large-v3 on GPUs with >= 8 GB, else large-v3-turbo – about as accurate
+      as large-v3, several times faster, and small enough for 4 GB GPUs and CPUs; better than the old default medium)  HF_TOKEN=<token for pyannote diarization models>
       AVAG_WHISPER_DEVICE=cuda|cpu  AVAG_WHISPER_BATCH=<batch size>  AVAG_WHISPER_COMPUTE=float16|int8_float16|int8
 Small GPUs (< 8 GB, e.g. 4 GB laptop GPUs that also drive the display) get int8 weights and a small batch so a
 transcription cannot exhaust video memory. Requests are processed one at a time for the same reason.
@@ -27,7 +28,7 @@ app = FastAPI()
 DEVICE = os.environ.get("AVAG_WHISPER_DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 _VRAM_GB = torch.cuda.get_device_properties(0).total_memory / 2**30 if DEVICE == "cuda" else 0
 _SMALL_GPU = DEVICE == "cuda" and _VRAM_GB < 8
-MODEL_NAME = os.environ.get("AVAG_WHISPER_MODEL") or ("medium" if _SMALL_GPU else "large-v3")
+MODEL_NAME = os.environ.get("AVAG_WHISPER_MODEL") or ("large-v3" if DEVICE == "cuda" and not _SMALL_GPU else "large-v3-turbo")
 COMPUTE = os.environ.get("AVAG_WHISPER_COMPUTE") or ("int8" if DEVICE == "cpu" else "int8_float16" if _SMALL_GPU else "float16")
 BATCH = int(os.environ.get("AVAG_WHISPER_BATCH") or (4 if _SMALL_GPU else 16))
 

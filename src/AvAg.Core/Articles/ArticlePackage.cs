@@ -33,9 +33,13 @@ public static class ArticlePackage
         return ms.ToArray();
     }
 
-    /// <summary>Writes the package into <paramref name="folder"/> (created if needed); returns the Markdown path.</summary>
+    /// <summary>Writes the package into <paramref name="folder"/> (created if needed); returns the Markdown path.
+    /// Screenshots of an earlier article in the same folder are deleted first, so none of them can be published by mistake.</summary>
     public static string WriteTo(WikiArticle a, string folder)
     {
+        var images = Path.Combine(folder, ImageFolder);
+        if (Directory.Exists(images))
+            foreach (var old in Directory.EnumerateFiles(images, "step-*.jpg")) File.Delete(old);
         foreach (var (path, content) in Files(a))
         {
             var full = Path.Combine(folder, path.Replace('/', Path.DirectorySeparatorChar));

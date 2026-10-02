@@ -23,8 +23,20 @@ public sealed class FfmpegService
     public string FfprobePath { get; init; } = "ffprobe";
 
     private static readonly Regex PtsRx = new(@"pts_time:(?<t>[0-9.\-e]+)", RegexOptions.Compiled);
+    // Probing is repeated for every decode of the same file: cache by path, size and modification time.
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<(string, long, DateTime), VideoInfo> _probes = new();
 
     public async Task<VideoInfo> ProbeAsync(string videoPath, CancellationToken ct = default)
+    {
+        var fi = new FileInfo(videoPath);
+        var key = (fi.FullName, fi.Exists ? fi.Length : -1, fi.Exists ? fi.LastWriteTimeUtc : default);
+        if (_probes.TryGetValue(key, out var cached)) return cached;
+        var info = await ProbeUncachedAsync(videoPath, ct);
+        if (fi.Exists) _probes[key] = info;
+        return info;
+    }
+
+    private async Task<VideoInfo> ProbeUncachedAsync(string videoPath, CancellationToken ct)
     {
         var (stdout, _, code) = await RunAsync(FfprobePath,
             ["-v", "error", "-print_format", "json", "-show_streams", "-show_format", videoPath], null, ct);
@@ -59,12 +71,34 @@ public sealed class FfmpegService
 
     /// <summary>Compressed mono MP3 for upload to a cloud speech service (16 kHz, <paramref name="kbps"/> kbit/s:
     /// 32 kbit/s ≈ 14 MB per hour, well under the usual 25 MB request limit).</summary>
-    public async Task<string> EncodeMp3Async(string audioPath, string outMp3Path, int kbps = 32, CancellationToken ct = default)
+    public async Task<string> EncodeMp3Async(string audioPath, string outMp3Path, int kbps = 32, CancellationToken ct = default,
+                                             double? startS = null, double? endS = null)
     {
-        var (_, stderr, code) = await RunAsync(FfmpegPath,
-            ["-y", "-loglevel", "error", "-i", audioPath, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", $"{kbps}k", outMp3Path], null, ct);
+        var args = new List<string> { "-y", "-loglevel", "error" };
+        if (startS is { } s) args.AddRange(["-ss", F(s)]);
+        if (endS is { } e) args.AddRange(["-to", F(e)]);
+        args.AddRange(["-i", audioPath, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", $"{kbps}k", outMp3Path]);
+        var (_, stderr, code) = await RunAsync(FfmpegPath, args, null, ct);
         if (code != 0) throw new InvalidOperationException($"ffmpeg mp3 encoding failed: {stderr}");
         return outMp3Path;
+    }
+
+    private static readonly Regex SilenceRx = new(@"silence_(?<k>start|end): (?<t>[0-9.]+)", RegexOptions.Compiled);
+
+    /// <summary>Pauses in speech (quieter than <paramref name="noiseDb"/> for at least <paramref name="minS"/> seconds).</summary>
+    public async Task<List<(double StartS, double EndS)>> DetectSilencesAsync(string audioPath, double noiseDb = -35, double minS = 0.5, CancellationToken ct = default)
+    {
+        var (_, stderr, _) = await RunAsync(FfmpegPath,
+            ["-hide_banner", "-nostats", "-i", audioPath, "-af", $"silencedetect=noise={F(noiseDb)}dB:d={F(minS)}", "-f", "null", "-"], null, ct);
+        var result = new List<(double, double)>();
+        double? start = null;
+        foreach (Match m in SilenceRx.Matches(stderr))
+        {
+            double t = double.Parse(m.Groups["t"].Value, CultureInfo.InvariantCulture);
+            if (m.Groups["k"].Value == "start") start = t;
+            else if (start is { } s0) { result.Add((s0, t)); start = null; }
+        }
+        return result;
     }
 
     /// <summary>Single frame at a time as PNG (for sidecar UI parsing / OCR).</summary>
@@ -79,17 +113,31 @@ public sealed class FfmpegService
     /// <summary>
     /// Decode grayscale frames at <paramref name="fps"/> between <paramref name="startS"/> and <paramref name="endS"/>
     /// (null = whole video), optionally scaled to <paramref name="scaleWidth"/>. Real PTS values are parsed from the
-    /// showinfo filter so variable-frame-rate sources keep a correct time base.
+    /// showinfo filter so variable-frame-rate sources keep a correct time base. Holds every frame in memory – for long
+    /// passes use <see cref="StreamGrayFramesAsync"/>.
     /// </summary>
     public async Task<List<GrayFrame>> DecodeGrayFramesAsync(string videoPath, double fps, double? startS = null, double? endS = null,
                                                              int? scaleWidth = null, CancellationToken ct = default)
     {
+        var frames = new List<GrayFrame>();
+        await StreamGrayFramesAsync(videoPath, fps, frames.Add, startS, endS, scaleWidth, ct);
+        return frames;
+    }
+
+    /// <summary>
+    /// Like <see cref="DecodeGrayFramesAsync"/>, but hands every frame to <paramref name="onFrame"/> as soon as it is
+    /// decoded instead of keeping them all: memory stays constant however long the video is, and the analysis runs while
+    /// ffmpeg decodes the next frames. Each frame has its own pixel buffer, so it may be kept.
+    /// </summary>
+    public async Task StreamGrayFramesAsync(string videoPath, double fps, Action<GrayFrame> onFrame, double? startS = null, double? endS = null,
+                                            int? scaleWidth = null, CancellationToken ct = default)
+    {
         var args = new List<string> { "-loglevel", "info", "-nostats", "-hide_banner" };
         if (startS is { } s) args.AddRange(["-ss", F(s)]);
         if (endS is { } e) args.AddRange(["-to", F(e)]);
-        args.AddRange(["-i", videoPath]);
         // -copyts keeps absolute timestamps after -ss so pts_time stays on the media time base.
-        if (startS is not null) args.Insert(args.IndexOf("-i"), "-copyts");
+        if (startS is not null) args.Add("-copyts");
+        args.AddRange(["-i", videoPath]);
         var vf = $"fps={F(fps)}";
         if (scaleWidth is { } sw) vf += $",scale={sw}:-2:flags=area";
         vf += ",showinfo";
@@ -102,26 +150,30 @@ public sealed class FfmpegService
         var psi = new ProcessStartInfo(FfmpegPath) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false };
         foreach (var a in args) psi.ArgumentList.Add(a);
         using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Could not start ffmpeg");
+        using var kill = ct.Register(() => { try { proc.Kill(entireProcessTree: true); } catch { /* already gone */ } });
 
-        var ptsList = new List<double>();
+        // showinfo writes a frame's PTS to stderr before the frame reaches stdout, so frame i waits for PTS i.
+        var pts = System.Threading.Channels.Channel.CreateUnbounded<double>();
         var stderrTask = Task.Run(async () =>
         {
-            string? line;
-            while ((line = await proc.StandardError.ReadLineAsync(ct)) is not null)
+            try
             {
-                var m = PtsRx.Match(line);
-                if (m.Success && double.TryParse(m.Groups["t"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var t))
-                    lock (ptsList) ptsList.Add(t);
+                string? line;
+                while ((line = await proc.StandardError.ReadLineAsync(ct)) is not null)
+                {
+                    var m = PtsRx.Match(line);
+                    if (m.Success && double.TryParse(m.Groups["t"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var t))
+                        pts.Writer.TryWrite(t);
+                }
             }
+            finally { pts.Writer.TryComplete(); }
         }, ct);
 
-        var frames = new List<GrayFrame>();
-        int frameBytes = w * h;
-        var buf = new byte[frameBytes];
+        int frameBytes = w * h, idx = 0;
         var stdout = proc.StandardOutput.BaseStream;
-        int idx = 0;
         while (true)
         {
+            var buf = new byte[frameBytes];
             int read = 0;
             while (read < frameBytes)
             {
@@ -130,19 +182,12 @@ public sealed class FfmpegService
                 read += n;
             }
             if (read < frameBytes) break;
-            frames.Add(new GrayFrame { Index = idx++, PtsS = double.NaN, Width = w, Height = h, Pixels = (byte[])buf.Clone() });
+            // Fall back to index/fps if the PTS could not be parsed.
+            double t = await pts.Reader.WaitToReadAsync(ct) && pts.Reader.TryRead(out var p) ? p : (startS ?? 0) + idx / fps;
+            onFrame(new GrayFrame { Index = idx++, PtsS = t, Width = w, Height = h, Pixels = buf });
         }
         await proc.WaitForExitAsync(ct);
         await stderrTask;
-
-        // Attach PTS (showinfo lines are emitted in output order). Fall back to index/fps if parsing failed.
-        var result = new List<GrayFrame>(frames.Count);
-        for (int i = 0; i < frames.Count; i++)
-        {
-            double pts = i < ptsList.Count ? ptsList[i] : (startS ?? 0) + i / fps;
-            result.Add(new GrayFrame { Index = i, PtsS = pts, Width = frames[i].Width, Height = frames[i].Height, Pixels = frames[i].Pixels });
-        }
-        return result;
     }
 
     public static async Task<(string Stdout, string Stderr, int ExitCode)> RunAsync(string exe, IEnumerable<string> args, string? workDir, CancellationToken ct)

@@ -19,7 +19,10 @@ builder.Services.ConfigureHttpJsonOptions(o =>
     o.SerializerOptions.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.SnakeCaseLower));
 });
 
-builder.Services.AddSingleton(builder.Configuration.GetSection("AvAg").Get<WebSettings>() ?? new WebSettings());
+var settings = builder.Configuration.GetSection("AvAg").Get<WebSettings>() ?? new WebSettings();
+// One OpenAI key (user secret of any OpenAI service, or OPENAI_API_KEY) serves speech, screen reading and the article.
+settings.Services.ShareOpenAiKey(Environment.GetEnvironmentVariable("OPENAI_API_KEY"));
+builder.Services.AddSingleton(settings);
 // All AI implementations come from here. To add another AI, register it on the factory, e.g.
 //   factory.TextGenerator.Register("my-llm", o => new MyTextGenerator(o.Url!, o.Model));
 // and select it in appsettings.json: "Services": { "TextGenerator": { "Provider": "my-llm", ... } }.

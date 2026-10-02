@@ -83,7 +83,10 @@ public sealed class AiServiceFactory
              .Register("whisperx-json", o => new JsonFileAsr(f.Asr.RequirePath(o)))
              .Register("openai", o => new OpenAiTranscriber(f.Asr.RequireUrl(o), o.Model, o.ApiKey, f.Asr.Timeout(o), o.Prompt, o.AlignUrl));
         f.UiParser.Register("omniparser", o => new OmniParserSidecar(f.UiParser.RequireUrl(o), o.ApiKey, f.UiParser.Timeout(o)))
-                  .Register("ui-json", o => new JsonFileUiParser(f.UiParser.RequirePath(o)));
+                  .Register("ui-json", o => new JsonFileUiParser(f.UiParser.RequirePath(o)))
+                  // One request per frame: a short timeout (default 2 min), not the sidecars' 30 min.
+                  .Register("openai-vision", o => new VisionLlmUiParser(new OpenAiCompatibleTextGenerator(f.UiParser.RequireUrl(o), o.Model, o.ApiKey,
+                      o.TimeoutOr(TimeSpan.FromMinutes(2)), vision: true, o.ReasoningEffort)), "vision-llm");
         f.Grounder.Register("molmo", o => new MolmoPointSidecar(f.Grounder.RequireUrl(o), o.ApiKey, f.Grounder.Timeout(o)))
                   .Register("qwen-vl", o => new Qwen3VlClient(f.Grounder.RequireUrl(o), o.Model, o.ApiKey, f.Grounder.Timeout(o)));
         f.Tracker.Register("sam2", o => new Sam2Sidecar(f.Tracker.RequireUrl(o), o.ApiKey, f.Tracker.Timeout(o)));
@@ -98,10 +101,10 @@ public sealed class AiServiceFactory
     public PipelineServices CreatePipelineServices(AiServicesOptions o) => new()
     {
         Asr = CreateAsr(o.EffectiveAsr) ?? throw new InvalidOperationException("Speech recognition is switched off: configure Services:Asr or provide a transcript file."),
-        UiParser = UiParser.Create(o.UiParser) ?? new NullUiParser(),
-        Grounder = Grounder.Create(o.Grounder),
-        Tracker = Tracker.Create(o.Tracker),
-        ClipDescriber = ClipDescriber.Create(o.ClipDescriber),
+        UiParser = Chain(UiParser, o.UiParser, (p, pn, f, fn) => new FallbackUiParser(p, pn, f, fn)) ?? new NullUiParser(),
+        Grounder = Chain(Grounder, o.Grounder, (p, pn, f, fn) => new FallbackGrounder(p, pn, f, fn)),
+        Tracker = Chain(Tracker, o.Tracker, (p, pn, f, fn) => new FallbackTracker(p, pn, f, fn)),
+        ClipDescriber = Chain(ClipDescriber, o.ClipDescriber, (p, pn, f, fn) => new FallbackClipDescriber(p, pn, f, fn)),
     };
 
     /// <summary>The article writer for the configured language model, or null to keep the rule-based article.
@@ -110,21 +113,19 @@ public sealed class AiServiceFactory
         CreateTextGenerator(o.TextGenerator) is { } llm ? new LlmArticleWriter(llm) : null;
 
     /// <summary>Speech recognition with its fallback chain (e.g. OpenAI → local WhisperX).</summary>
-    public IAsrService? CreateAsr(ServiceOptions o)
-    {
-        var primary = Asr.Create(o);
-        var fallback = o.Fallback is { } fb ? CreateAsr(fb) : null;
-        return primary is null ? fallback
-             : fallback is null ? primary
-             : new FallbackAsrService(primary, Asr.Resolve(o)!, fallback, Asr.Resolve(o.Fallback)!);
-    }
+    public IAsrService? CreateAsr(ServiceOptions o) => Chain(Asr, o, (p, pn, f, fn) => new FallbackAsrService(p, pn, f, fn));
 
     /// <summary>Language model with its fallback chain (e.g. OpenAI → local Ollama).</summary>
-    public ITextGenerator? CreateTextGenerator(ServiceOptions o)
+    public ITextGenerator? CreateTextGenerator(ServiceOptions o) => Chain(TextGenerator, o, (p, _, f, _) => new FallbackTextGenerator(p, f));
+
+    /// <summary>The service these options configure, wrapped with its <see cref="ServiceOptions.Fallback"/> chain.</summary>
+    private static T? Chain<T>(ProviderRegistry<T> registry, ServiceOptions o, Func<T, string, T, string, T> withFallback) where T : class
     {
-        var primary = TextGenerator.Create(o);
-        var fallback = o.Fallback is { } fb ? CreateTextGenerator(fb) : null;
-        return primary is null ? fallback : fallback is null ? primary : new FallbackTextGenerator(primary, fallback);
+        var primary = registry.Create(o);
+        var fallback = o.Fallback is { } fb ? Chain(registry, fb, withFallback) : null;
+        return primary is null ? fallback
+             : fallback is null ? primary
+             : withFallback(primary, registry.Resolve(o)!, fallback, registry.Resolve(o.Fallback)!);
     }
 
     /// <summary>Like <see cref="CreateArticleWriter"/>, but a broken configuration returns null and the reason,
@@ -133,7 +134,7 @@ public sealed class AiServiceFactory
     {
         problem = null;
         try { return CreateArticleWriter(o); }
-        catch (InvalidOperationException ex) { problem = ex.Message; return null; }
+        catch (Exception ex) when (ex is InvalidOperationException or FormatException or ArgumentException) { problem = ex.Message; return null; }
     }
 
     /// <summary>Provider and endpoint per capability for logs and status pages – never API keys.</summary>

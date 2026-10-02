@@ -27,7 +27,10 @@ public static class ArticleEndpoints
 
         // A broken model configuration must not cost the article: fall back to the rule-based one and say why.
         string? problem = null;
-        var writer = request.UseWriter ? factory.TryCreateArticleWriter(settings.Services, out problem) : null;
+        // Private: the transcript only goes to a language model on this machine / network.
+        var services = request.Private ? settings.Services.LocalOnly() : settings.Services;
+        var writer = request.UseWriter ? factory.TryCreateArticleWriter(services, out problem) : null;
+        if (request.UseWriter && writer is null && problem is null && request.Private) problem = "private video – no local language model configured";
         var svc = new ArticleService(writer, writerProblem: problem);
         job.Article = await svc.CreateAsync(job.Result, job.VideoPath, request, job.Cancel.Token);
         job.Log.AddRange(svc.Log);

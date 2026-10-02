@@ -14,6 +14,8 @@ public sealed class ArticleScreenshotService
 {
     private readonly FfmpegService _ff;
     public ArticleScreenshotService(FfmpegService ff) => _ff = ff;
+    /// <summary>ffmpeg processes run at the same time (each one seeks and decodes on its own).</summary>
+    private static int Parallelism => Math.Clamp(Environment.ProcessorCount / 2, 1, 6);
 
     public int ScreenshotWidth { get; init; } = 1280;
     /// <summary>Mean absolute difference (0–255) below which two thumbnails count as "the same screen".</summary>
@@ -27,17 +29,27 @@ public sealed class ArticleScreenshotService
     /// </summary>
     public async Task<string> RefineTimesAsync(WikiArticle m, string videoPath, CancellationToken ct)
     {
+        // The choice per step depends on the step before, but the frames do not: decode every step's span in parallel first.
+        var spans = new List<GrayFrame>[m.Steps.Count];
+        await Parallel.ForEachAsync(Enumerable.Range(0, m.Steps.Count), new ParallelOptions { MaxDegreeOfParallelism = Parallelism, CancellationToken = ct }, async (i, token) =>
+        {
+            var s = m.Steps[i];
+            spans[i] = s.PointXyPx is not null && s.ScreenshotS is { } fixedT
+                ? await _ff.DecodeGrayFramesAsync(videoPath, 2, fixedT, fixedT + 0.5, scaleWidth: 160, ct: token)
+                : await _ff.DecodeGrayFramesAsync(videoPath, 2, s.TimeS, Math.Min(Math.Max(s.EndS, s.TimeS + 1.0) + 1.0, s.TimeS + 15.0), scaleWidth: 160, ct: token);
+        });
+
         GrayFrame? prev = null;
         int moved = 0, dropped = 0;
-        foreach (var s in m.Steps)
+        for (int k = 0; k < m.Steps.Count; k++)
         {
-            if (s.PointXyPx is not null && s.ScreenshotS is { } fixedT)
+            var s = m.Steps[k];
+            var frames = spans[k];
+            if (s.PointXyPx is not null && s.ScreenshotS is not null)
             {
-                prev = (await _ff.DecodeGrayFramesAsync(videoPath, 2, fixedT, fixedT + 0.5, scaleWidth: 160, ct: ct)).FirstOrDefault() ?? prev;
+                prev = frames.FirstOrDefault() ?? prev;
                 continue;
             }
-            double from = s.TimeS, to = Math.Min(Math.Max(s.EndS, s.TimeS + 1.0) + 1.0, s.TimeS + 15.0);
-            var frames = await _ff.DecodeGrayFramesAsync(videoPath, 2, from, to, scaleWidth: 160, ct: ct);
             if (frames.Count == 0) continue;
 
             double bestScore = double.NegativeInfinity, bestNovelty = 0;
@@ -64,11 +76,13 @@ public sealed class ArticleScreenshotService
     /// Up to <paramref name="max"/> frames that show what happened on the supporter's screen, for a vision model:
     /// the video is scanned at 1 fps as thumbnails; a frame qualifies when the screen has just changed and then
     /// settled, or when a click was observed; near-duplicates are dropped; the biggest changes win when there are too
-    /// many. Returned in time order as 1280-px JPEGs labelled "Bild n (mm:ss)".
+    /// many. Returned in time order as 1280-px JPEGs labelled "Bild n (mm:ss)". <paramref name="thumbnails"/> (1 fps,
+    /// 160 px, from the analysis) save decoding the whole video again.
     /// </summary>
-    public async Task<IReadOnlyList<PromptImage>> KeyframesAsync(string videoPath, EventGraph graph, CancellationToken ct, int max = 12)
+    public async Task<IReadOnlyList<PromptImage>> KeyframesAsync(string videoPath, EventGraph graph, CancellationToken ct, int max = 12,
+                                                                IReadOnlyList<GrayFrame>? thumbnails = null)
     {
-        var thumbs = await _ff.DecodeGrayFramesAsync(videoPath, 1, scaleWidth: 160, ct: ct);
+        var thumbs = thumbnails is { Count: > 0 } ? thumbnails : await _ff.DecodeGrayFramesAsync(videoPath, 1, scaleWidth: 160, ct: ct);
         if (thumbs.Count == 0) return [];
         var clicks = graph.Events.Where(e => e.GroundingStatus is GroundingStatus.Observed or GroundingStatus.Tracked).Select(e => e.Temporal.PeakS).ToList();
 
@@ -89,47 +103,50 @@ public sealed class ArticleScreenshotService
             if (chosen.All(c => Diff(c, frame) >= SameScreenThreshold && Math.Abs(c.PtsS - frame.PtsS) >= 2)) chosen.Add(frame);
         }
 
-        var images = new List<PromptImage>();
-        int n = 0;
-        foreach (var f in chosen.OrderBy(f => f.PtsS))
+        var ordered = chosen.OrderBy(f => f.PtsS).ToList();
+        var jpegs = new byte[]?[ordered.Count];
+        await Parallel.ForEachAsync(Enumerable.Range(0, ordered.Count), new ParallelOptions { MaxDegreeOfParallelism = Parallelism, CancellationToken = ct }, async (i, token) =>
         {
             var tmp = Path.Combine(Path.GetTempPath(), $"avag_frame_{Guid.NewGuid():N}.jpg");
             try
             {
                 var (_, _, code) = await FfmpegService.RunAsync(_ff.FfmpegPath,
-                    ["-y", "-loglevel", "error", "-ss", f.PtsS.ToString("0.###", CultureInfo.InvariantCulture), "-i", videoPath,
-                     "-frames:v", "1", "-vf", $"scale='min({ScreenshotWidth},iw)':-2", "-q:v", "5", tmp], null, ct);
-                if (code == 0 && File.Exists(tmp))
-                    images.Add(new PromptImage($"Bild {++n} ({ArticleRenderer.Ts(f.PtsS)})", await File.ReadAllBytesAsync(tmp, ct)));
+                    ["-y", "-loglevel", "error", "-ss", ordered[i].PtsS.ToString("0.###", CultureInfo.InvariantCulture), "-i", videoPath,
+                     "-frames:v", "1", "-vf", $"scale='min({ScreenshotWidth},iw)':-2", "-q:v", "5", tmp], null, token);
+                if (code == 0 && File.Exists(tmp)) jpegs[i] = await File.ReadAllBytesAsync(tmp, token);
             }
             finally { try { File.Delete(tmp); } catch { /* best effort */ } }
-        }
+        });
+        var images = new List<PromptImage>();
+        for (int i = 0; i < ordered.Count; i++)
+            if (jpegs[i] is { } jpeg) images.Add(new PromptImage($"Bild {images.Count + 1} ({ArticleRenderer.Ts(ordered[i].PtsS)})", jpeg));
         return images;
     }
 
     /// <summary>Extracts one JPEG per step that has a screenshot moment; returns a message per failed frame.</summary>
     public async Task<List<string>> ExtractAsync(WikiArticle m, string videoPath, VideoInfo v, CancellationToken ct)
     {
-        var problems = new List<string>();
         int w = Math.Min(ScreenshotWidth, v.WidthPx > 0 ? v.WidthPx : ScreenshotWidth);
         int h = v.WidthPx > 0 ? (int)Math.Round(v.HeightPx * (double)w / v.WidthPx / 2) * 2 : 0;
-        foreach (var s in m.Steps)
+        var problems = new string?[m.Steps.Count];
+        await Parallel.ForEachAsync(Enumerable.Range(0, m.Steps.Count), new ParallelOptions { MaxDegreeOfParallelism = Parallelism, CancellationToken = ct }, async (i, token) =>
         {
-            if (s.ScreenshotS is not { } t) continue;
+            var s = m.Steps[i];
+            if (s.ScreenshotS is not { } t) return;
             t = Math.Clamp(t, 0, Math.Max(0, v.DurationS - 0.1));
             var tmp = Path.Combine(Path.GetTempPath(), $"avag_article_{Guid.NewGuid():N}.jpg");
             try
             {
                 var (_, err, code) = await FfmpegService.RunAsync(_ff.FfmpegPath,
                     ["-y", "-loglevel", "error", "-ss", t.ToString("0.###", CultureInfo.InvariantCulture), "-i", videoPath,
-                     "-frames:v", "1", "-vf", Filter(s, v, w), "-q:v", "4", tmp], null, ct);
-                if (code != 0 || !File.Exists(tmp)) { problems.Add($"screenshot at {t:0.0}s failed: {err.Trim()}"); continue; }
-                s.ScreenshotJpeg = await File.ReadAllBytesAsync(tmp, ct);
+                     "-frames:v", "1", "-vf", Filter(s, v, w), "-q:v", "4", tmp], null, token);
+                if (code != 0 || !File.Exists(tmp)) { problems[i] = $"screenshot at {t:0.0}s failed: {err.Trim()}"; return; }
+                s.ScreenshotJpeg = await File.ReadAllBytesAsync(tmp, token);
                 s.ScreenshotS = t; s.ScreenshotWidth = w; s.ScreenshotHeight = h;
             }
             finally { try { File.Delete(tmp); } catch { /* best effort */ } }
-        }
-        return problems;
+        });
+        return problems.OfType<string>().ToList();
     }
 
     /// <summary>FFmpeg filter: red boxes around the observed click (and its UI element), then scale to the output width.</summary>
