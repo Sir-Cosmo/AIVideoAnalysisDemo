@@ -34,5 +34,5 @@ var app = builder.Build();
 app.UseDefaultFiles();
 app.UseStaticFiles();
 app.MapJobEndpoints();
-app.MapManualEndpoints();
+app.MapArticleEndpoints();
 app.Run();

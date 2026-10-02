@@ -8,6 +8,9 @@ internal static class Http
 {
     public static string? Opt(IFormCollection f, string key) => string.IsNullOrWhiteSpace(f[key]) ? null : f[key].ToString().Trim();
 
+    /// <summary>A field's value with "absent" and "sent empty" kept apart: null if the form has no such field, "" if it is empty.</summary>
+    public static string? Field(IFormCollection f, string key) => f.ContainsKey(key) ? f[key].ToString().Trim() : null;
+
     public static double Double(IFormCollection f, string key, double fallback) =>
         double.TryParse(f[key], NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : fallback;
 

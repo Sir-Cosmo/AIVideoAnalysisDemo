@@ -57,6 +57,16 @@ public sealed class FfmpegService
         return outWavPath;
     }
 
+    /// <summary>Compressed mono MP3 for upload to a cloud speech service (16 kHz, <paramref name="kbps"/> kbit/s:
+    /// 32 kbit/s ≈ 14 MB per hour, well under the usual 25 MB request limit).</summary>
+    public async Task<string> EncodeMp3Async(string audioPath, string outMp3Path, int kbps = 32, CancellationToken ct = default)
+    {
+        var (_, stderr, code) = await RunAsync(FfmpegPath,
+            ["-y", "-loglevel", "error", "-i", audioPath, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", $"{kbps}k", outMp3Path], null, ct);
+        if (code != 0) throw new InvalidOperationException($"ffmpeg mp3 encoding failed: {stderr}");
+        return outMp3Path;
+    }
+
     /// <summary>Single frame at a time as PNG (for sidecar UI parsing / OCR).</summary>
     public async Task<string> ExtractFramePngAsync(string videoPath, double timeS, string outPngPath, CancellationToken ct = default)
     {

@@ -1,4 +1,3 @@
-using System.Net.Http.Json;
 using System.Text.Json;
 using AvAg.Core;
 
@@ -15,8 +14,14 @@ public sealed class Qwen3VlClient : HttpServiceClient, IClipDescriber, IVideoGro
     private readonly string _model;
     public double SampleFps { get; init; } = 2.0;
 
-    public Qwen3VlClient(string baseUrl, string? model = null, HttpClient? http = null, TimeSpan? timeout = null) : base(baseUrl, http, timeout)
-        => _model = string.IsNullOrWhiteSpace(model) ? DefaultModel : model;
+    /// <param name="baseUrl">Server address with or without the API version (http://host:8005 or http://host:8005/v1).</param>
+    public Qwen3VlClient(string baseUrl, string? model = null, string? apiKey = null, TimeSpan? timeout = null) : base(baseUrl, apiKey, timeout)
+    {
+        _model = string.IsNullOrWhiteSpace(model) ? DefaultModel : model;
+        _route = BaseUri.AbsolutePath.TrimEnd('/').EndsWith("/v1", StringComparison.OrdinalIgnoreCase) ? "chat/completions" : "v1/chat/completions";
+    }
+
+    private readonly string _route;
 
     public async Task<string> DescribeAsync(string videoPath, double startS, double endS, string language, CancellationToken ct = default)
     {
@@ -59,9 +64,15 @@ public sealed class Qwen3VlClient : HttpServiceClient, IClipDescriber, IVideoGro
             },
             mm_processor_kwargs = new { fps = SampleFps, video_start = startS, video_end = endS },
         };
-        using var resp = await Http.PostAsJsonAsync(new Uri(BaseUri, "v1/chat/completions"), body, ct);
-        resp.EnsureSuccessStatusCode();
-        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
-        return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+        var answer = await PostForStringAsync(_route, body, ct);
+        try
+        {
+            using var doc = JsonDocument.Parse(answer);
+            return doc.RootElement.GetProperty("choices")[0].GetProperty("message").GetProperty("content").GetString() ?? "";
+        }
+        catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or IndexOutOfRangeException)
+        {
+            throw new InvalidOperationException($"{nameof(Qwen3VlClient)}: unexpected answer: {answer[..Math.Min(answer.Length, 300)]}", ex);
+        }
     }
 }

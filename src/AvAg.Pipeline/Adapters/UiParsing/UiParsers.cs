@@ -15,10 +15,10 @@ internal sealed record UiElementsJson(List<UiElementsJson.El> Elements)
 /// <summary>Provider "omniparser": sidecars/omniparser_server.py — POST /parse {image_path} → {elements:[{bbox,text,text_confidence,interactive_confidence,class}]}.</summary>
 public sealed class OmniParserSidecar : HttpServiceClient, IUiParser
 {
-    public OmniParserSidecar(string baseUrl, HttpClient? http = null, TimeSpan? timeout = null) : base(baseUrl, http, timeout) { }
+    public OmniParserSidecar(string baseUrl, string? apiKey = null, TimeSpan? timeout = null) : base(baseUrl, apiKey, timeout) { }
 
     public async Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, CancellationToken ct = default) =>
-        (await PostAsync<object, UiElementsJson>("parse", new { image_path = Path.GetFullPath(framePngPath) }, ct)).ToDetections();
+        (await PostAsync<UiElementsJson>("parse", new { image_path = Path.GetFullPath(framePngPath) }, ct)).ToDetections();
 }
 
 /// <summary>Provider "ui-json": the same UI elements for every frame, read from a JSON file (tests, golden runs).</summary>

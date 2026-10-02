@@ -3,7 +3,7 @@ using System.Reflection;
 using AvAg.Core;
 using AvAg.Pipeline;
 using AvAg.Pipeline.Adapters;
-using AvAg.Pipeline.Manuals;
+using AvAg.Pipeline.Articles;
 using AvAg.Pipeline.Services;
 using AvAg.Pipeline.Media;
 using AvAg.Pipeline.Vision;
@@ -177,157 +177,445 @@ static class Tests
     }
 
     // --------------------------------------------------------------------------------------------
-    // Manual
+    // Wiki article from a support call
     // --------------------------------------------------------------------------------------------
-    static Transcript Spoken(string lang, params (double s, string text)[] sentences) =>
+    static Transcript Call(string lang, params (double s, string speaker, string text)[] sentences) =>
         new(lang, sentences.Select(x =>
         {
             var ws = x.text.Split(' ');
-            var words = ws.Select((w, i) => new Word(w, x.s + i * 0.3, x.s + i * 0.3 + 0.25)).ToList();
-            return new TranscriptSegment(x.s, words[^1].EndS, x.text, words);
+            var words = ws.Select((w, i) => new Word(w, x.s + i * 0.3, x.s + i * 0.3 + 0.25, 1.0, x.speaker)).ToList();
+            return new TranscriptSegment(x.s, words[^1].EndS, x.text, words, x.speaker);
         }).ToList());
 
-    [Test] public static void Manual_Steps_From_Instructions_With_Click_Marker()
+    static Transcript SupportCall() => Call("de",
+        (0.0, "SPEAKER_01", "Grüezi, hier ist Müller von der Beispiel AG."),
+        (3.0, "SPEAKER_01", "Ich kann seit heute keine Rechnungen drucken, es kommt die Meldung „Kein Drucker zugewiesen“."),
+        (9.0, "SPEAKER_00", "Klicken Sie bitte oben auf Datei."),
+        (13.0, "SPEAKER_00", "Dann sehen Sie die Druckereinstellungen."),
+        (17.0, "SPEAKER_00", "Wählen Sie hier Ihren Drucker aus und klicken Sie auf Speichern."),
+        (23.0, "SPEAKER_01", "Ja, jetzt funktioniert es wieder."),
+        (26.0, "SPEAKER_01", "Vielen Dank, auf Wiederhören."));
+
+    [Test] public static void Article_From_Support_Call_Problem_Steps_Verification()
     {
-        var tr = Spoken("de",
-            (0.0, "In diesem Video zeige ich, wie man eine Rechnung speichert."),
-            (4.0, "Äh, klicken Sie oben auf Datei."),
-            (8.0, "Dann öffnet sich das Menü mit allen Optionen."),
-            (12.0, "Klicken Sie hier auf Speichern."),
-            (16.0, "Abonniert den Kanal und bis zum nächsten Mal."));
+        var tr = SupportCall();
         var refs = new AudioRefParser().Parse(tr);
-        var video = new VideoInfo("v", 20, 1920, 1080, 30);
+        var video = new VideoInfo("v", 30, 1920, 1080, 30);
         var ui = new UiElementRegistry();
-        ui.Observe(13.0, [new UiElementRegistry.Detection(new BBox(1432, 812, 1538, 858), "Speichern", 0.98, 0.99, "button")]);
-        var save = refs.Single(r => r.StartS >= 12);
+        ui.Observe(19.0, [new UiElementRegistry.Detection(new BBox(1432, 812, 1538, 858), "Speichern", 0.98, 0.99, "button")]);
+        var save = refs.Last(r => r.StartS >= 17);
         var e = Ev("vis_0001", save.AnchorS + 0.1, new(1489, 836)); e.TargetId = "ui_000";
         var graph = new EventGraphBuilder().Build(video, refs, [e], new CrossModalResolver().Resolve(refs, [e], ui), ui);
 
-        var m = new ManualBuilder().Build(tr, refs, graph, "Rechnung speichern.mp4");
-        Assert.Eq("de", m.Language, "language from transcript");
-        Assert.Eq("Anleitung: Rechnung speichern", m.Title, "title from file name");
-        Assert.Eq(2, m.Steps.Count, "two instructions → two steps");
-        Assert.True(m.Steps[0].Instruction.StartsWith("Klicken Sie oben auf Datei"), "filler removed: " + m.Steps[0].Instruction);
-        Assert.True(m.Steps[0].Details?.Contains("Menü") == true, "explanation attached to previous step");
-        Assert.True(m.Summary?.Contains("Rechnung") == true, "intro becomes the overview");
-        Assert.Eq(1489, m.Steps[1].PointXyPx?[0] ?? -1, "observed click marker on the save step");
-        Assert.True(!m.Steps.Any(s => s.Instruction.Contains("Abonniert")) && m.Steps[1].Details is null, "outro dropped");
-
-        var html = ManualRenderer.Html(m);
-        Assert.True(html.Contains("Schritt für Schritt") && html.Contains("Klicken Sie hier auf Speichern."), "html");
-        var docx = ManualDocx.Write(m);
-        using var zip = new System.IO.Compression.ZipArchive(new MemoryStream(docx));
-        var doc = new StreamReader(zip.GetEntry("word/document.xml")!.Open()).ReadToEnd();
-        System.Xml.Linq.XDocument.Parse(doc);
-        Assert.True(doc.Contains("Speichern") && zip.GetEntry("word/styles.xml") is not null, "docx");
+        var a = new ArticleBuilder().Build(tr, refs, graph);
+        Assert.Eq("de", a.Language, "language from transcript");
+        Assert.True(a.Problem?.Contains("keine Rechnungen drucken") == true, "problem: " + a.Problem);
+        Assert.True(a.ErrorMessages.SequenceEqual(["Kein Drucker zugewiesen"]), "error message: " + string.Join("|", a.ErrorMessages));
+        Assert.Eq(2, a.Steps.Count, "two instructions");
+        Assert.True(a.Steps[0].Instruction.StartsWith("Klicken Sie bitte oben auf Datei") && a.Steps[0].Details?.Contains("Druckereinstellungen") == true, "step 1 + details");
+        Assert.Eq(1489, a.Steps[1].PointXyPx?[0] ?? -1, "observed click marker on the save step");
+        Assert.True(a.Verification?.Contains("funktioniert es wieder") == true && a.Resolved == true, "verification");
+        Assert.True(!a.Steps.Any(s => s.Instruction.Contains("Wiederhören")) && a.Problem!.Contains("Grüezi") == false, "small talk dropped");
     }
 
-    [Test] public static void Manual_Sections_And_Key_Combinations()
+    [Test] public static void Redactor_Removes_Personal_Data_Not_Ordinary_Words()
     {
-        var m = new Manual
+        string R(string s) => PersonalDataRedactor.Redact(s, "de").Text;
+        Assert.Eq("Schreiben Sie an [entfernt] oder rufen Sie [entfernt] an.", R("Schreiben Sie an hans.muster@example.ch oder rufen Sie 079 123 45 67 an."), "e-mail + Swiss mobile");
+        Assert.Eq("Nummer [entfernt].", R("Nummer +41 44 123 45 67."), "international phone");
+        Assert.Eq("IBAN [entfernt]", R("IBAN CH93 0076 2011 6238 5295 7"), "IBAN");
+        Assert.Eq("Ihre Kundennummer ist [entfernt].", R("Ihre Kundennummer ist 4711-08."), "labelled number");
+        Assert.Eq("Frau [entfernt] hat angerufen.", R("Frau Müller hat angerufen."), "title + name");
+        Assert.Eq("Grüezi, mein Name ist [entfernt].", R("Grüezi, mein Name ist Hans Muster."), "introduced name");
+        Assert.Eq("Hier ist [entfernt] von der [entfernt].", R("Hier ist Müller von der Beispiel AG."), "caller + company");
+        foreach (var ok in new[] { "Klicken Sie auf Speichern.", "this is the menu", "Drücken Sie Strg + C.", "Version 2024.1 ab 10:30", "Hier ist das Menü Datei." })
+            Assert.Eq(ok, R(ok), "no false positive");
+    }
+
+    [Test] public static void Article_Markdown_Package_And_Private_Text_Only()
+    {
+        var a = new WikiArticle
         {
-            Title = "T", Language = "en",
+            Title = "Rechnung lässt sich nicht drucken", Language = "de", Problem = "Beim Drucken erscheint ein Fehler.",
+            ErrorMessages = ["Kein Drucker zugewiesen"], Cause = "Kein Standarddrucker im Profil.", Keywords = ["Drucken", "Rechnung"],
+            Verification = "Drucken Sie die Rechnung erneut.", Resolved = true,
             Steps =
             [
-                new ManualStep { Number = 1, Section = "Method 1: Shortcut", Instruction = "Press Windows key + Shift + R.", TimeS = 1 },
-                new ManualStep { Number = 2, Section = "Method 2: Snipping Tool", Instruction = "Open the Snipping Tool and pick step 1 + 2.", TimeS = 9 },
+                new ArticleStep { Number = 1, Section = "Variante 1: Profil", Instruction = "Drücken Sie Strg + P.", ScreenshotJpeg = [1, 2, 3], ScreenshotWidth = 10, ScreenshotHeight = 6 },
+                new ArticleStep { Number = 2, Section = "Variante 2: Support", Instruction = "Lassen Sie die Lizenz zurücksetzen.", Actor = StepActor.Support },
             ],
         };
-        var html = ManualRenderer.Html(m);
-        Assert.True(html.Contains("<kbd>Windows key</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd>"), "key combination as kbd");
-        Assert.True(!html.Contains("<kbd>1</kbd>"), "ordinary '1 + 2' is not a key combination");
-        Assert.True(html.Contains("<h3 class=\"section\">Method 2: Snipping Tool</h3>") && html.Contains("start=\"2\""), "sections continue numbering");
-        using var zip = new System.IO.Compression.ZipArchive(new MemoryStream(ManualDocx.Write(m)));
-        var doc = new StreamReader(zip.GetEntry("word/document.xml")!.Open()).ReadToEnd();
-        System.Xml.Linq.XDocument.Parse(doc);
-        Assert.True(doc.Contains("<w:b/></w:rPr><w:t xml:space=\"preserve\">Windows key + Shift + R</w:t>") && doc.Contains("Heading3"), "docx bold keys + section headings");
+        var md = ArticleRenderer.Markdown(a);
+        Assert.True(md.StartsWith("---\ntitle: \"Rechnung lässt sich nicht drucken\"\ntags: [\"Drucken\", \"Rechnung\"]") && md.Contains("status: draft"), "front matter");
+        Assert.True(md.Contains("## Problem") && md.Contains("**Fehlermeldung:** `Kein Drucker zugewiesen`") && md.Contains("## Ursache"), "problem + cause");
+        Assert.True(md.Contains("### Variante 2: Support") && md.Contains("*(nur durch den Support)*"), "sections + support-only steps");
+        Assert.True(md.Contains("Drücken Sie `Strg` + `P`.") && md.Contains("![Bildschirm bei Schritt 1](images/step-01.jpg)") && !md.Contains("step-02.jpg"), "keys + only existing images");
+        Assert.True(ArticleRenderer.Html(a).Contains("<kbd>Strg</kbd> + <kbd>P</kbd>"), "html preview");
+        using (var zip = new System.IO.Compression.ZipArchive(new MemoryStream(ArticlePackage.Zip(a))))
+            Assert.True(zip.Entries.Select(x => x.FullName).SequenceEqual(["article.md", "images/step-01.jpg"]), "zip layout");
+        Assert.Eq("rechnung-laesst-sich-nicht-drucken", ArticlePackage.Slug(a.Title), "slug");
     }
 
-    [Test] public static async Task Manual_Private_Video_Is_Text_Only()
+    [Test] public static async Task Article_Private_Video_Never_Reads_A_Frame()
     {
-        var tr = Spoken("de", (0.0, "Hier zeige ich das Speichern."), (4.0, "Klicken Sie hier auf Speichern."));
+        var tr = SupportCall();
         var refs = new AudioRefParser().Parse(tr);
-        var video = new VideoInfo("v", 10, 1920, 1080, 30);
-        var e = Ev("vis_0001", refs[0].AnchorS + 0.1, new(1489, 836));
+        var video = new VideoInfo("v", 30, 1920, 1080, 30);
+        var e = Ev("vis_0001", refs.Last().AnchorS + 0.1, new(1489, 836));
         var graph = new EventGraphBuilder().Build(video, refs, [e], new CrossModalResolver().Resolve(refs, [e], new UiElementRegistry()), new UiElementRegistry());
         var result = new PipelineResult { Graph = graph, Transcript = tr, AudioRefs = refs, VisualEvents = [e], TimelineDe = "", TimelineEn = "" };
 
-        // The video path does not exist: a text-only manual must not even try to read a frame from it.
-        var svc = new ManualService();
-        var m = await svc.CreateAsync(result, "does-not-exist.mp4", "Speichern.mp4", new ManualRequest(Private: true));
-        Assert.True(m.Private && m.Steps.Count == 1, "one private step");
-        Assert.True(m.Steps.All(s => s.ScreenshotJpeg is null && s.ScreenshotS is null && s.PointXyPx is null), "no screenshot, no click position");
-        Assert.True(!svc.Log.Any(l => l.Contains("screenshot at")), "no frame extraction attempted");
-        var html = ManualRenderer.Html(m);
-        Assert.True(!html.Contains("<img") && html.Contains("privates Video, nur Text") && html.Contains("Klicken Sie hier auf Speichern."), "html text only");
-        using var zip = new System.IO.Compression.ZipArchive(new MemoryStream(ManualDocx.Write(m)));
-        Assert.True(!zip.Entries.Any(x => x.FullName.StartsWith("word/media/")), "docx without images");
+        // The video path does not exist: a text-only article must not even try to read a frame from it.
+        var svc = new ArticleService();
+        var a = await svc.CreateAsync(result, "does-not-exist.mp4", new ArticleRequest(Private: true));
+        Assert.True(a.Private && a.Steps.Count == 2, "private article with steps");
+        Assert.True(a.Steps.All(s => s.ScreenshotJpeg is null && s.ScreenshotS is null && s.PointXyPx is null), "no screenshot, no click position");
+        Assert.True(!svc.Log.Any(l => l.Contains("screenshot")) || svc.Log.Any(l => l.Contains("no screenshots taken")), "no frame extraction");
+        var md = ArticleRenderer.Markdown(a);
+        Assert.True(!md.Contains("![") && md.Contains("private") && !md.Contains("Müller") && !md.Contains("Beispiel AG"), "text only, no names");
+        Assert.True(ArticlePackage.Files(a).Select(f => f.Path).SequenceEqual(["article.md"]), "package has no images");
     }
 
     // --------------------------------------------------------------------------------------------
     // Replaceable AI services
     // --------------------------------------------------------------------------------------------
-    sealed class FakeTextGenerator(string answer) : ITextGenerator
+    sealed class FakeTextGenerator(Func<string> answer) : ITextGenerator
     {
+        public FakeTextGenerator(string answer) : this(() => answer) { }
         public TextGenerationRequest? LastRequest { get; private set; }
         public string Name => "fake";
-        public Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default) { LastRequest = request; return Task.FromResult(answer); }
+        public Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default) { LastRequest = request; return Task.FromResult(answer()); }
+    }
+
+    sealed class ThrowingWriter(Exception ex) : IArticleWriter
+    {
+        public string Name => "throwing";
+        public Task<WikiArticle> WriteAsync(ArticleWriterInput input, CancellationToken ct = default) => throw ex;
+    }
+
+    /// <summary>
+    /// Every file git would commit (tracked + new, not ignored) is scanned for API keys. Keys belong in user secrets or
+    /// environment variables. The same patterns are enforced by tools/hooks/pre-commit.
+    /// </summary>
+    [Test] public static void Repository_Contains_No_Api_Keys()
+    {
+        var root = new DirectoryInfo(AppContext.BaseDirectory);
+        while (root is not null && !File.Exists(Path.Combine(root.FullName, "AvAg.sln"))) root = root.Parent;
+        if (root is null) return; // not running from a checkout
+        var psi = new System.Diagnostics.ProcessStartInfo("git", "ls-files --cached --others --exclude-standard")
+            { WorkingDirectory = root.FullName, RedirectStandardOutput = true, UseShellExecute = false };
+        string files;
+        try { using var p = System.Diagnostics.Process.Start(psi)!; files = p.StandardOutput.ReadToEnd(); p.WaitForExit(); }
+        catch (System.ComponentModel.Win32Exception) { return; } // git not installed
+
+        var key = new System.Text.RegularExpressions.Regex(
+            @"sk-(?:proj-|live-|svcacct-|admin-)?[A-Za-z0-9_-]{20,}|""ApiKey""\s*:\s*""[^""]+""|AIza[0-9A-Za-z_-]{30,}|xox[abp]-[0-9A-Za-z-]{10,}");
+        var text = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".cs", ".json", ".md", ".py", ".yml", ".yaml", ".html", ".js", ".props", ".csproj", ".sln", ".txt", ".sh", ".Modelfile", ".editorconfig", ".gitignore", "" };
+        var hits = files.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(f => text.Contains(Path.GetExtension(f)))
+            .Select(f => Path.Combine(root.FullName, f))
+            .Where(File.Exists)
+            .Where(f => key.IsMatch(File.ReadAllText(f)))
+            .ToList();
+        Assert.True(hits.Count == 0, "possible API key in: " + string.Join(", ", hits));
     }
 
     [Test] public static void ServiceFactory_Resolves_Providers_By_Name()
     {
         var f = AiServiceFactory.CreateDefault();
         Assert.True(f.Asr.Create(new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011" }) is WhisperXSidecar, "named provider");
-        Assert.True(f.UiParser.Create(new ServiceOptions { Url = "http://127.0.0.1:8003" }) is OmniParserSidecar, "Url only → default provider");
-        Assert.True(f.Grounder.Create(ServiceOptions.Off()) is null && f.Tracker.Create(new ServiceOptions()) is null, "none / empty → off");
+        Assert.True(f.Tracker.Create(new ServiceOptions { Url = "http://127.0.0.1:8004" }) is Sam2Sidecar, "Url only → default provider");
+        Assert.True(f.Grounder.Create(new ServiceOptions { Provider = "NONE", Url = "http://x" }) is null && f.Tracker.Create(new ServiceOptions()) is null, "none (any case) / empty → off");
         Assert.True(f.TextGenerator.Create(new ServiceOptions { Provider = "ollama", Url = "http://127.0.0.1:11434/v1", Model = "m" }) is OpenAiCompatibleTextGenerator, "alias");
-        Assert.True(f.Grounder.Create(ServiceOptions.Off().WithUrl("http://127.0.0.1:8002")) is MolmoPointSidecar, "URL override switches an off capability on");
+        Assert.True(f.CreatePipelineServices(new AiServicesOptions()).Asr is WhisperXSidecar, "no ASR configured → local WhisperX");
 
         try { f.Asr.Create(new ServiceOptions { Provider = "nope", Url = "http://x" }); throw new Exception("unknown provider accepted"); }
         catch (InvalidOperationException ex) { Assert.True(ex.Message.Contains("whisperx") && ex.Message.Contains("nope"), "error lists known providers: " + ex.Message); }
 
+        // A broken model configuration is reported, not thrown, when the article is created.
+        var broken = new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "olama", Url = "http://x/v1" } };
+        Assert.True(f.TryCreateArticleWriter(broken, out var problem) is null && problem!.Contains("olama"), "typo reported: " + problem);
+
         // Another AI is one registration away.
-        var custom = new FakeTextGenerator("{}");
-        f.TextGenerator.Register("my-llm", _ => custom);
-        Assert.True(f.CreateManualWriter(new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "my-llm" } }) is LlmManualWriter, "custom provider");
-        var services = f.CreatePipelineServices(new AiServicesOptions { Asr = ServiceOptions.FromFile("whisperx-json", "t.json") });
-        Assert.True(services.Asr is JsonFileAsr && services.UiParser is NullUiParser && services.Grounder is null, "pipeline services");
+        f.TextGenerator.Register("my-llm", _ => new FakeTextGenerator("{}"));
+        Assert.True(f.CreateArticleWriter(new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "my-llm" } }) is LlmArticleWriter, "custom provider");
+        Assert.True(f.Describe(new AiServicesOptions { TextGenerator = new ServiceOptions { Provider = "my-llm", ApiKey = "secret" } }).Values.All(v => v is null || !v.Contains("secret")), "no keys in status");
     }
 
-    [Test] public static async Task LlmManualWriter_Anchors_Steps_To_Transcript_Sentences()
+    [Test] public static void ServiceOverrides_Follow_One_Set_Of_Rules()
     {
-        var tr = Spoken("en", (0.0, "Today we save a file."), (4.0, "Click File at the top."), (8.0, "Then press Ctrl + S to save it."));
-        var sentences = ManualBuilder.Sentences(tr);
-        var draft = new ManualBuilder().Build(tr, new AudioRefParser().Parse(tr), null, "save.mp4");
+        var cfg = new AiServicesOptions
+        {
+            Asr = new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011", LocalModule = "whisperx_server:app" },
+            Tracker = new ServiceOptions { Provider = "sam2", Url = "http://127.0.0.1:8004" },
+            ClipDescriber = new ServiceOptions { Provider = "qwen-vl", Url = "http://127.0.0.1:8005/v1", Model = "Qwen/Qwen3-VL-32B-Instruct", TimeoutSeconds = 60 },
+        };
+        var none = cfg.WithOverrides(new ServiceOverrides());
+        Assert.True(none.Tracker.Url == "http://127.0.0.1:8004" && none.Asr.LocalModule == "whisperx_server:app", "no override keeps the configuration");
+        Assert.True(none.Grounder.Provider == "qwen-vl" && none.Grounder.Model == "Qwen/Qwen3-VL-32B-Instruct" && none.Grounder.TimeoutSeconds == 60 && none.Grounder.LocalModule is null,
+            "qwen describer also points, with its model and timeout");
+
+        var cleared = cfg.WithOverrides(new ServiceOverrides(TrackerUrl: "", GrounderUrl: ""));
+        Assert.True(cleared.Tracker.IsOff && cleared.Grounder.IsOff, "an empty field switches the service off");
+        var explicitNone = new AiServicesOptions { Grounder = ServiceOptions.Off(), ClipDescriber = cfg.ClipDescriber }.WithOverrides(new ServiceOverrides());
+        Assert.True(explicitNone.Grounder.IsOff, "an explicit \"none\" grounder is respected");
+
+        var custom = new AiServicesOptions { Asr = new ServiceOptions { Provider = "my-asr", Url = "http://127.0.0.1:9000" } };
+        Assert.True(custom.WithOverrides(new ServiceOverrides()).Asr.LocalModule is null, "a custom ASR does not inherit the WhisperX auto-start");
+        var file = cfg.WithOverrides(new ServiceOverrides(AsrUrl: "", TranscriptFile: "t.json"));
+        Assert.True(file.Asr.Provider == "whisperx-json" && file.Asr.LocalModule is null, "a transcript file replaces speech recognition");
+    }
+
+    [Test] public static void A_Url_Override_Never_Takes_Keys_To_Another_Host()
+    {
+        var cfg = new AiServicesOptions
+        {
+            Asr = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1", ApiKey = "sk-secret", AlignUrl = "http://127.0.0.1:8011",
+                                       Fallback = new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011" } },
+            ClipDescriber = new ServiceOptions { Provider = "qwen-vl", Url = "http://127.0.0.1:8005/v1", Model = "Qwen/Qwen3-VL-32B-Instruct" },
+        };
+        var other = cfg.WithOverrides(new ServiceOverrides(AsrUrl: "http://10.0.0.5:8011"));
+        Assert.True(other.Asr.Provider == "whisperx" && other.Asr.ApiKey is null && other.Asr.AlignUrl is null && other.Asr.Fallback is null,
+            "another URL in the WhisperX field is WhisperX there, without the OpenAI key");
+        var same = cfg.WithOverrides(new ServiceOverrides(AsrUrl: "https://api.openai.com/v1/"));
+        Assert.True(same.Asr.Provider == "openai" && same.Asr.ApiKey == "sk-secret" && same.Asr.Fallback is not null, "the configured URL keeps the configuration");
+        var qwen = cfg.WithOverrides(new ServiceOverrides(ClipDescriberUrl: "http://10.0.0.6:8005/v1"));
+        Assert.True(qwen.ClipDescriber.Provider == "qwen-vl" && qwen.ClipDescriber.Model == "Qwen/Qwen3-VL-32B-Instruct", "same sidecar elsewhere keeps its model");
+        Assert.True(new AiServicesOptions().EffectiveAsr.LocalModule == AiServicesOptions.LocalAsrModule, "the default WhisperX is started automatically");
+    }
+
+    [Test] public static void Redactor_And_Cleaner_Keep_Ordinary_Instructions()
+    {
+        string R(string s, string lang = "de") => PersonalDataRedactor.Redact(s, lang).Text;
+        foreach (var ok in new[] { "Geben Sie Ihr Passwort ein.", "Wählen Sie den Mandant aus.", "Das Passwort ist falsch." })
+            Assert.Eq(ok, R(ok), "no false positive");
+        Assert.Eq("Enter your password again.", R("Enter your password again.", "en"), "no false positive (en)");
+        Assert.Eq("Passwort: [entfernt].", R("Passwort: geheim."), "value after a colon");
+        Assert.Eq("Mein Benutzername ist [entfernt].", R("Mein Benutzername ist h_muster."), "identifier after 'ist'");
+
+        Assert.Eq("Klicken Sie auf Speichern, um die Änderung zu übernehmen.", TranscriptSentences.Clean("Klicken Sie auf Speichern, um die Änderung zu übernehmen."), "'um … zu' stays");
+        Assert.Eq("So geht das.", TranscriptSentences.Clean("So geht das."), "a meaningful 'So' stays");
+        Assert.Eq("Klicken Sie hier.", TranscriptSentences.Clean("Also, äh, klicken Sie hier."), "fillers go");
+    }
+
+    [Test] public static void Article_Rules_Do_Not_Swallow_Steps_Or_The_Problem()
+    {
+        var tr = Call("de",
+            (0.0, "SPEAKER_01", "Ich kann nicht drucken, weil der Drucker fehlt."),
+            (4.0, "SPEAKER_00", "Genau, klicken Sie oben auf Datei."),
+            (8.0, "SPEAKER_00", "Perfekt, dann wählen Sie den Drucker aus."),
+            (12.0, "SPEAKER_00", "Klicken Sie dann auf das Zahnrad, das ist da oben rechts."),
+            (17.0, "SPEAKER_01", "Jetzt funktioniert es wieder."));
+        var a = new ArticleBuilder().Build(tr, new AudioRefParser().Parse(tr), null);
+        Assert.Eq(3, a.Steps.Count, "steps: " + string.Join(" | ", a.Steps.Select(s => s.Instruction)));
+        Assert.True(a.Problem?.Contains("nicht drucken") == true && a.Cause is null, $"complaint is the problem, not the cause: {a.Problem} / {a.Cause}");
+        Assert.True(a.Verification?.Contains("funktioniert") == true, "verification");
+
+        var en = Call("en", (0.0, "SPEAKER_01", "I can't print, it says the printer isn't assigned."), (5.0, "SPEAKER_00", "Click on File."));
+        Assert.Eq(0, new ArticleBuilder().Build(en, new AudioRefParser().Parse(en), null).ErrorMessages.Count, "contractions are no quotes");
+    }
+
+    [Test] public static void OpenAiTranscriber_Knows_Language_And_Length_Without_Being_Told()
+    {
+        var diarized = OpenAiTranscriber.Parse("""{"text":"…","segments":[{"start":0,"end":3,"text":"Klicken Sie bitte hier auf das Menü und dann auf Speichern.","speaker":"A"}]}""", null);
+        Assert.Eq("de", diarized.Language, "language recognised from the text");
+        Assert.Eq("en", OpenAiTranscriber.GuessLanguage("Now you can click on the button and then it is saved."), "english");
+        var textOnly = OpenAiTranscriber.Parse("""{"text":"Klicken Sie hier."}""", "de", audioDurationS: 42.5);
+        Assert.Near(42.5, textOnly.Segments.Single().End, 1e-9, "text-only answer spans the recording");
+    }
+
+    [Test] public static void Restored_Step_Joins_The_Section_Before_It()
+    {
+        var draft = new WikiArticle { Title = "T", Language = "de", Steps = [new ArticleStep { Instruction = "Klicken Sie auf Speichern.", TimeS = 40, EndS = 43, PointXyPx = [1, 2] }] };
+        var written = new WikiArticle { Title = "T", Language = "de", Steps =
+        [
+            new ArticleStep { Section = "Option 1", Instruction = "A", TimeS = 30, EndS = 35 },
+            new ArticleStep { Section = "Option 1", Instruction = "B", TimeS = 50, EndS = 55 },
+        ] };
+        Assert.Eq(1, ArticleService.RestoreObservedSteps(draft, written), "restored");
+        Assert.True(written.Steps.All(s => s.Section == "Option 1"), "no repeated section heading");
+    }
+
+    [Test] public static void Sidecar_Json_Is_Read_As_Snake_Case()
+    {
+        var p = System.Text.Json.JsonSerializer.Deserialize<VideoPoint>("""{"object_id":"btn","time_s":12.5,"x":10,"y":20,"confidence":0.9,"label":"OK"}""", Json.Options)!;
+        Assert.True(p.ObjectId == "btn" && Math.Abs(p.TimeS - 12.5) < 1e-9 && p.Confidence > 0.8, "molmo point fields bind");
+    }
+
+    [Test] public static async Task LlmArticleWriter_Anchors_Steps_To_Transcript_Sentences()
+    {
+        var tr = SupportCall();
+        var sentences = TranscriptSentences.Split(tr);
+        var draft = new ArticleBuilder().Build(tr, new AudioRefParser().Parse(tr), null);
         var llm = new FakeTextGenerator("""
-            Here you go: {"title": "Save a file", "summary": "You save a file.", "prerequisites": ["none"],
-             "steps": [{"title": "Save", "instruction": "Press Ctrl + S.", "details": null, "sentences": [3]},
-                       {"section": null, "title": "Open File", "instruction": "Click File.", "sentences": ["2"]}],
-             "tips": ["Use the toolbar instead."]}
+            Hier ist der Artikel: {"title": "Rechnung lässt sich nicht drucken", "problem": "Beim Drucken erscheint eine Fehlermeldung.",
+             "error_messages": ["„Kein Drucker zugewiesen“"], "cause": "none", "applies_to": null,
+             "steps": [{"title": "Drucker wählen", "instruction": "Wählen Sie den Drucker aus und klicken Sie auf Speichern.", "actor": "customer", "sentences": [5]},
+                       {"section": null, "title": "Datei öffnen", "instruction": "Klicken Sie auf Datei.", "actor": "customer", "sentences": ["3"]},
+                       {"title": "Lizenz", "instruction": "Der Support setzt die Lizenz zurück.", "actor": "support", "sentences": [4]}],
+             "verification": "Drucken Sie erneut.", "notes": [], "keywords": ["Drucken", "Drucker"], "resolved": true}
             """);
-        var m = await new LlmManualWriter(llm).WriteAsync(draft, sentences);
-        Assert.True(llm.LastRequest!.Json && llm.LastRequest.User.Contains("[2] (00:04) Click File at the top."), "numbered transcript in the prompt");
-        Assert.Eq("llm:fake", m.Method, "method");
-        Assert.Eq("Click File.", m.Steps[0].Instruction, "steps in video order");
-        Assert.Near(4.0, m.Steps[0].TimeS, 1e-6, "time from sentence 2, not from the model");
-        Assert.Near(8.0, m.Steps[1].TimeS, 1e-6, "time from sentence 3");
-        Assert.True(m.Prerequisites.Count == 0 && m.Tips.Count == 1, "'none' prerequisite dropped");
+        var a = await new LlmArticleWriter(llm).WriteAsync(new ArticleWriterInput(draft, sentences) { ObservedActions = ["[00:19] Klick auf „Speichern“"] });
+        Assert.True(llm.LastRequest!.Json && llm.LastRequest.User.Contains("SPEAKER_00: Klicken Sie bitte oben auf Datei."), "numbered transcript with speakers in the prompt");
+        Assert.True(llm.LastRequest.User.Contains("[00:19] Klick auf „Speichern“") && llm.LastRequest.Images.Count == 0, "observed clicks in the prompt; no images for a text-only model");
+        Assert.Eq("llm:fake", a.Method, "method");
+        Assert.Eq("Klicken Sie auf Datei.", a.Steps[0].Instruction, "steps in video order");
+        Assert.Near(sentences[2].StartS, a.Steps[0].TimeS, 1e-6, "time from sentence 3, not from the model");
+        Assert.True(a.Steps.Single(s => s.Title == "Lizenz").Actor == StepActor.Support, "support-only step");
+        Assert.True(a.Cause is null && a.Resolved == true && a.ErrorMessages.SequenceEqual(["Kein Drucker zugewiesen"]), "'none' dropped, quotes stripped, fields read");
 
-        try { LlmManualWriter.Parse("""{"steps": [{"instruction": "Do it."}]}""", draft, sentences); throw new Exception("accepted"); }
-        catch (InvalidOperationException) { /* fewer than 2 steps / not tied to the transcript */ }
+        var unsolved = LlmArticleWriter.Parse("""{"title": "X", "problem": "Y", "steps": [], "resolved": false}""", draft, sentences);
+        Assert.True(unsolved.Steps.Count == 0 && unsolved.Resolved == false, "an unsolved case may have no steps");
+        try { LlmArticleWriter.Parse("""{"steps": [], "resolved": true}""", draft, sentences); throw new Exception("accepted"); }
+        catch (InvalidOperationException) { /* solved but no steps */ }
     }
 
-    [Test] public static async Task ManualService_Keeps_Draft_When_The_Model_Fails()
+    // ---- OpenAI adapters, against fake HTTP answers in the documented formats --------------------------------------
+    sealed class FakeHttp(Func<HttpRequestMessage, string, (int Status, string Body)> respond) : HttpMessageHandler
     {
-        var tr = Spoken("en", (0.0, "Today we save a file."), (4.0, "Click File at the top."));
+        public List<(HttpRequestMessage Request, string Body)> Calls { get; } = new();
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            string body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct);
+            Calls.Add((request, body));
+            var (status, text) = respond(request, body);
+            return new HttpResponseMessage((System.Net.HttpStatusCode)status) { Content = new StringContent(text) };
+        }
+    }
+
+    static string Chat(string content) => System.Text.Json.JsonSerializer.Serialize(new { choices = new[] { new { message = new { content }, finish_reason = "stop" } } });
+
+    [Test] public static void OpenAiTranscriber_Reads_Diarized_And_Word_Timestamps()
+    {
+        var diarized = OpenAiTranscriber.Parse("""
+            {"text":"…","segments":[
+              {"type":"transcript.text.segment","id":"seg_0","start":0.5,"end":4.0,"text":"Ich kann nicht speichern.","speaker":"A"},
+              {"type":"transcript.text.segment","id":"seg_1","start":4.2,"end":7.0,"text":"Klicken Sie auf Speichern.","speaker":"B"}]}
+            """, "de");
+        var t = WhisperXMapper.ToTranscript(diarized);
+        Assert.True(t.Language == "de" && t.Segments.Count == 2 && t.Segments[1].Speaker == "SPEAKER_B", "segments with speakers");
+        Assert.True(t.Segments[1].Words.Count == 4 && t.Segments[1].Words[0].StartS >= 4.2 && t.Segments[1].Words[^1].EndS <= 7.0 + 1e-9, "words spread over their segment");
+
+        var verbose = OpenAiTranscriber.Parse("""
+            {"language":"german","duration":3.0,"text":"Klicken Sie hier.",
+             "words":[{"word":"Klicken","start":0.1,"end":0.5},{"word":"Sie","start":0.6,"end":0.8},{"word":"hier.","start":0.9,"end":1.2}],
+             "segments":[{"id":0,"start":0.0,"end":1.3,"text":"Klicken Sie hier."}]}
+            """, null);
+        var v = WhisperXMapper.ToTranscript(verbose);
+        Assert.True(v.Language == "de" && Math.Abs(v.Segments[0].Words[2].EndS - 1.2) < 1e-9 && v.Segments[0].Words[2].Score == 1.0, "word times from whisper-1, 'german' → de");
+        Assert.Eq(1, new AudioRefParser().Parse(v).Count, "instruction found in the transcript");
+    }
+
+    [Test] public static async Task OpenAiTranscriber_Sends_The_Documented_Request()
+    {
+        var dir = Directory.CreateTempSubdirectory("avag_asr_test").FullName;
+        var wav = Path.Combine(dir, "a.wav");
+        await FfmpegService.RunAsync("ffmpeg", ["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", "-ac", "1", "-ar", "16000", wav], null, default);
+        var http = new FakeHttp((_, _) => (200, """{"text":"Hallo.","segments":[{"start":0.1,"end":1.5,"text":"Hallo.","speaker":"A"}]}"""));
+        var asr = new OpenAiTranscriber("https://api.openai.com/v1", null, "test-key", TimeSpan.FromSeconds(30), prompt: "Messerli", http: new HttpClient(http));
+        var t = await asr.TranscribeAsync(wav, "de", diarize: true);
+        var (req, body) = http.Calls.Single();
+        Assert.True(req.RequestUri!.ToString() == "https://api.openai.com/v1/audio/transcriptions" && req.Headers.Authorization?.Parameter == "test-key", "endpoint + bearer key");
+        Assert.True(body.Contains("gpt-4o-transcribe-diarize") && body.Contains("diarized_json") && body.Contains("chunking_strategy") && body.Contains("audio/mpeg"), "diarize request as MP3");
+        Assert.True(!body.Contains("Messerli"), "no prompt for the diarize model");
+        Assert.True(t.Segments.Single().Speaker == "SPEAKER_A", "answer mapped");
+        try { await new OpenAiTranscriber("https://api.openai.com/v1", null, null, TimeSpan.FromSeconds(5), http: new HttpClient(http)).TranscribeAsync(wav, "de", true); throw new Exception("no key accepted"); }
+        catch (InvalidOperationException ex) { Assert.True(ex.Message.Contains("API key"), "missing key reported"); }
+        Directory.Delete(dir, true);
+    }
+
+    [Test] public static async Task OpenAiTextGenerator_Uses_Reasoning_Parameters_Images_And_Retries()
+    {
+        var http = new FakeHttp((_, _) => (200, Chat("{\"ok\":true}")));
+        var gpt5 = new OpenAiCompatibleTextGenerator("https://api.openai.com/v1", "gpt-5.5", "k", TimeSpan.FromSeconds(30), vision: true, reasoningEffort: "medium", http: new HttpClient(http));
+        var answer = await gpt5.GenerateAsync(new TextGenerationRequest("sys", "user", Json: true) { Images = [new PromptImage("Bild 1 (00:05)", [1, 2, 3])] });
+        var body = System.Text.Json.Nodes.JsonNode.Parse(http.Calls.Single().Body)!;
+        Assert.True(answer == "{\"ok\":true}" && gpt5.SupportsImages, "answer");
+        Assert.True(body["max_completion_tokens"] is not null && body["max_tokens"] is null && body["temperature"] is null && (string?)body["reasoning_effort"] == "medium", "reasoning-model parameters");
+        var parts = body["messages"]![1]!["content"]!.AsArray();
+        Assert.True(parts.Count == 3 && (string?)parts[1]!["text"] == "Bild 1 (00:05)" && ((string)parts[2]!["image_url"]!["url"]!).StartsWith("data:image/jpeg;base64,"), "image after its label");
+
+        // A server that rejects a parameter: the request is repeated without it.
+        int n = 0;
+        var picky = new FakeHttp((_, b) => ++n == 1 && b.Contains("\"temperature\"")
+            ? (400, """{"error":{"message":"Unsupported parameter: 'temperature' is not supported with this model."}}""") : (200, Chat("fine")));
+        Assert.Eq("fine", await new OpenAiCompatibleTextGenerator("https://x/v1", "some-model", null, http: new HttpClient(picky)).GenerateAsync(new TextGenerationRequest("s", "u")), "retried");
+        Assert.True(picky.Calls.Count == 2 && !picky.Calls[1].Body.Contains("\"temperature\""), "second request without temperature");
+
+        var quota = new FakeHttp((_, _) => (429, """{"error":{"message":"You have no credits remaining.","code":"credit_balance_exhausted"}}"""));
+        try { await new OpenAiCompatibleTextGenerator("https://x/v1", "gpt-5.5", "k", http: new HttpClient(quota)).GenerateAsync(new TextGenerationRequest("s", "u")); throw new Exception("accepted"); }
+        catch (HttpRequestException ex) { Assert.True(ex.Message.Contains("no credits"), "API error message passed on: " + ex.Message); }
+    }
+
+    sealed class FailingAsr(Exception ex) : IAsrService
+    {
+        public Task<Transcript> TranscribeAsync(string audioWavPath, string? languageHint, bool diarize, CancellationToken ct = default) => throw ex;
+    }
+
+    [Test] public static async Task Fallbacks_Switch_To_The_Local_Service()
+    {
+        var json = Path.Combine(Path.GetTempPath(), $"avag_tr_{Guid.NewGuid():N}.json");
+        File.WriteAllText(json, """{"language":"de","segments":[{"start":0,"end":1,"text":"Hallo.","words":[{"word":"Hallo.","start":0,"end":1}]}]}""");
+        var asr = new FallbackAsrService(new FailingAsr(new HttpRequestException("You have no credits remaining.")), "openai", new JsonFileAsr(json), "whisperx-json");
+        var t = await asr.TranscribeAsync("x.wav", "de", true);
+        Assert.True(t.Segments.Count > 0 && asr.FallbackNotes.Single().Contains("openai not usable (You have no credits remaining.) – used whisperx-json"), "ASR fallback: " + string.Join("|", asr.FallbackNotes));
+
+        var local = new FakeTextGenerator("local answer");
+        var llm = new FallbackTextGenerator(new LlmThatFails(), local);
+        var answer = await llm.GenerateAsync(new TextGenerationRequest("s", "u") { Images = [new PromptImage("Bild 1", [1])] });
+        Assert.True(answer == "local answer" && llm.Name == "fake" && local.LastRequest!.Images.Count == 0, "text fallback, images not sent to a text-only model");
+
+        var f = AiServiceFactory.CreateDefault();
+        var cfg = new AiServicesOptions
+        {
+            Asr = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1", Fallback = new ServiceOptions { Provider = "whisperx", Url = "http://127.0.0.1:8011", LocalModule = "whisperx_server:app" } },
+            TextGenerator = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1", Model = "gpt-5.5", Vision = true, Fallback = new ServiceOptions { Provider = "ollama", Url = "http://127.0.0.1:11434/v1", Model = "avag-article" } },
+        };
+        Assert.True(f.CreatePipelineServices(cfg).Asr is FallbackAsrService && f.CreateArticleWriter(cfg) is LlmArticleWriter { WantsScreens: true }, "fallback chains built");
+        Assert.True(cfg.All.Any(o => o.LocalModule == "whisperx_server:app"), "the fallback sidecar is started too");
+        Assert.True(f.Describe(cfg)["text_generator"] == "openai gpt-5.5 @ https://api.openai.com/v1 → fallback ollama avag-article @ http://127.0.0.1:11434/v1", "status shows the chain: " + f.Describe(cfg)["text_generator"]);
+    }
+
+    sealed class LlmThatFails : ITextGenerator
+    {
+        public string Name => "gpt-5.5";
+        public bool SupportsImages => true;
+        public Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default) => throw new HttpRequestException("429 no credits");
+    }
+
+    [Test] public static void ArticleService_Restores_Observed_Steps_The_Model_Left_Out()
+    {
+        var draft = new WikiArticle { Title = "T", Language = "de", Steps =
+        [
+            new ArticleStep { Number = 1, Instruction = "Öffnen Sie die Einstellungen.", TimeS = 30, EndS = 35 },
+            new ArticleStep { Number = 2, Instruction = "Klicken Sie auf Speichern.", TimeS = 40, EndS = 43, PointXyPx = [496, 264] },
+        ] };
+        var written = new WikiArticle { Title = "T", Language = "de", Steps = [new ArticleStep { Number = 1, Instruction = "Hinterlegen Sie den Speicherpfad.", TimeS = 30, EndS = 35 }] };
+        Assert.Eq(1, ArticleService.RestoreObservedSteps(draft, written), "the observed click step comes back");
+        Assert.True(written.Steps.Select(s => s.Number + ":" + s.Instruction).SequenceEqual(["1:Hinterlegen Sie den Speicherpfad.", "2:Klicken Sie auf Speichern."]), "in video order");
+        Assert.Eq(0, ArticleService.RestoreObservedSteps(draft, written), "nothing added twice");
+    }
+
+    [Test] public static async Task ArticleService_Keeps_Draft_Whatever_The_Model_Does()
+    {
+        var tr = SupportCall();
         var refs = new AudioRefParser().Parse(tr);
-        var graph = new EventGraphBuilder().Build(new VideoInfo("v", 10, 640, 360, 30), refs, [], [], new UiElementRegistry());
+        var graph = new EventGraphBuilder().Build(new VideoInfo("v", 30, 640, 360, 30), refs, [], [], new UiElementRegistry());
         var result = new PipelineResult { Graph = graph, Transcript = tr, AudioRefs = refs, VisualEvents = [], TimelineDe = "", TimelineEn = "" };
 
-        var svc = new ManualService(new LlmManualWriter(new FakeTextGenerator("sorry, no JSON")));
-        var m = await svc.CreateAsync(result, "does-not-exist.mp4", "v.mp4", new ManualRequest(Private: true));
-        Assert.Eq("extractive", m.Method, "rule-based draft kept");
-        Assert.True(m.Steps.Count >= 1 && svc.Log.Any(l => l.Contains("kept the rule-based manual")), "fallback logged");
+        IArticleWriter[] failing =
+        [
+            new LlmArticleWriter(new FakeTextGenerator("sorry, no JSON")),
+            new LlmArticleWriter(new FakeTextGenerator(() => throw new System.Text.Json.JsonException("gateway returned HTML"))),
+            new LlmArticleWriter(new FakeTextGenerator(() => throw new TimeoutException("too slow"))),
+            new ThrowingWriter(new ArgumentOutOfRangeException("index")),
+        ];
+        foreach (var w in failing)
+        {
+            var svc = new ArticleService(w);
+            var a = await svc.CreateAsync(result, "does-not-exist.mp4", new ArticleRequest(Private: true));
+            Assert.True(a.Method == "rule-based" && a.Steps.Count == 2 && svc.Log.Any(l => l.Contains("kept the rule-based article")), $"fallback for {w.Name}: {string.Join(" | ", svc.Log)}");
+        }
     }
 
     // --------------------------------------------------------------------------------------------

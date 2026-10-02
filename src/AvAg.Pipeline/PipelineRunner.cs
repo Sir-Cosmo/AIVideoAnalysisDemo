@@ -74,6 +74,9 @@ public sealed class PipelineRunner
             {
                 var wav = await ff.ExtractAudioAsync(videoPath, Path.Combine(work, "audio_16k_mono.wav"), ct);
                 transcript = await _svc.Asr.TranscribeAsync(wav, _cfg.LanguageHint, _cfg.Diarize, ct);
+                if (_svc.Asr is Services.IReportsFallback f) foreach (var note in f.FallbackNotes) Log("asr: " + note);
+                int speakers = transcript.Segments.Select(s => s.Speaker).Where(s => s is not null).Distinct().Count();
+                if (speakers > 0) Log($"asr: {speakers} speakers");
             }
             else
             {

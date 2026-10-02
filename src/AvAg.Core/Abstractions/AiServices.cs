@@ -48,28 +48,51 @@ public interface IClipDescriber
     Task<string> DescribeAsync(string videoPath, double startS, double endS, string language, CancellationToken ct = default);
 }
 
-/// <summary>A text-only prompt for a language model.</summary>
-/// <param name="Json">Ask the model for a single JSON object (providers that support a JSON mode enforce it).</param>
-public sealed record TextGenerationRequest(string System, string User, bool Json = false, int MaxTokens = 2000, double Temperature = 0.2);
+/// <summary>An image sent along with a prompt, e.g. a frame of the supporter's screen.</summary>
+/// <param name="Label">How the prompt refers to it, e.g. "Bild 3 (00:42)".</param>
+public sealed record PromptImage(string Label, byte[] Jpeg);
 
-/// <summary>
-/// Plain text-in / text-out language model. Everything that writes prose (the manual) goes through this, so switching
-/// between a local model (Ollama), a hosted one (OpenAI, Azure OpenAI, …) or another vendor is one adapter.
-/// </summary>
-public interface ITextGenerator
+/// <summary>A prompt for a language model.</summary>
+/// <param name="Json">Ask the model for a single JSON object (providers that support a JSON mode enforce it).</param>
+public sealed record TextGenerationRequest(string System, string User, bool Json = false, int MaxTokens = 2000, double Temperature = 0.2)
 {
-    /// <summary>Short name for logs and the manual's "written by" line, e.g. the model name.</summary>
-    string Name { get; }
-    Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default);
+    /// <summary>Images for models that can read them (<see cref="ITextGenerator.SupportsImages"/>); others never get any.</summary>
+    public IReadOnlyList<PromptImage> Images { get; init; } = [];
 }
 
 /// <summary>
-/// Turns the rule-based draft into the final manual text. Implementations must keep each step anchored to the
-/// transcript (<see cref="ManualStep.TimeS"/>/<see cref="ManualStep.EndS"/> from real sentences) and throw
-/// <see cref="InvalidOperationException"/> when they cannot produce a usable manual – the caller then keeps the draft.
+/// Language model. Everything that writes prose (the wiki article) goes through this, so switching between a local
+/// model (Ollama), a hosted one (OpenAI, Azure OpenAI, …) or another vendor is one adapter.
 /// </summary>
-public interface IManualWriter
+public interface ITextGenerator
+{
+    /// <summary>Short name for logs and the article's "written by" line, e.g. the model name.</summary>
+    string Name { get; }
+    /// <summary>The model reads images (<see cref="TextGenerationRequest.Images"/>).</summary>
+    bool SupportsImages => false;
+    Task<string> GenerateAsync(TextGenerationRequest request, CancellationToken ct = default);
+}
+
+/// <summary>What an article writer gets.</summary>
+/// <param name="Draft">The rule-based article – fallback, and the facts the writer can rely on.</param>
+/// <param name="Sentences">The whole call as sentences (with speaker labels when available).</param>
+public sealed record ArticleWriterInput(WikiArticle Draft, IReadOnlyList<Sentence> Sentences)
+{
+    /// <summary>Frames of the supporter's screen at the moments that matter – empty for private videos.</summary>
+    public IReadOnlyList<PromptImage> Screens { get; init; } = [];
+    /// <summary>Clicks observed in the video, one line each: "[00:41] Klick auf „Speichern“ (bei 496, 264)".</summary>
+    public IReadOnlyList<string> ObservedActions { get; init; } = [];
+}
+
+/// <summary>
+/// Turns the rule-based draft into the final wiki article. Implementations must keep each solution step anchored to the
+/// transcript (<see cref="ArticleStep.TimeS"/>/<see cref="ArticleStep.EndS"/> from real sentences) and throw
+/// <see cref="InvalidOperationException"/> when they cannot produce a usable article – the caller then keeps the draft.
+/// </summary>
+public interface IArticleWriter
 {
     string Name { get; }
-    Task<Manual> WriteAsync(Manual draft, IReadOnlyList<ManualBuilder.Sentence> sentences, CancellationToken ct = default);
+    /// <summary>The writer can use screen images; the caller then extracts some (never for private videos).</summary>
+    bool WantsScreens => false;
+    Task<WikiArticle> WriteAsync(ArticleWriterInput input, CancellationToken ct = default);
 }

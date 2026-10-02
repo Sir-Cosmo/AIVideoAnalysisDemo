@@ -24,7 +24,7 @@ public sealed class JobRunner
         {
             job.State = JobState.Running;
             var o = job.Options!;
-            await _sidecars.EnsureReadyAsync(o.Services.Asr, job.Log.Add, job.Cancel.Token);
+            await _sidecars.EnsureReadyAsync(o.Services, job.Log.Add, job.Cancel.Token);
 
             var runner = new PipelineRunner(new PipelineConfig
             {

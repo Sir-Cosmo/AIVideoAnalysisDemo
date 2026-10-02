@@ -47,8 +47,8 @@ public sealed class Job
     public List<string> Log { get; } = new();
     public PipelineResult? Result { get; set; }
     public string? GraphJson { get; set; }
-    public AvAg.Core.Manual? Manual { get; set; }
-    /// <summary>Set at upload: every manual for this video is text only (no screenshots).</summary>
+    public AvAg.Core.WikiArticle? Article { get; set; }
+    /// <summary>Set at upload: every article for this video is text only (no screenshots).</summary>
     public bool Private { get; set; }
     public string? Error { get; set; }
 
@@ -64,7 +64,7 @@ public sealed class Job
         id = Id, state = State, video_name = VideoName, @private = Private, error = Error, log = Log,
         created = Created, finished = Finished,
         graph = Result?.Graph,
-        manual = Manual is null ? null : new { Manual.Title, Manual.Method, steps = Manual.Steps.Count, Manual.Language },
+        article = Article is null ? null : new { Article.Title, Article.Method, steps = Article.Steps.Count, Article.Language, Article.Private },
         timeline_de = Result?.TimelineDe, timeline_en = Result?.TimelineEn,
         audio_refs = Result?.AudioRefs.Select(a => new { a.Id, a.StartS, a.EndS, a.AnchorS, a.Text, a.Action, a.Deictic, a.ExplicitTarget, a.SpeakerId }),
         transcript = Result?.Transcript.Segments.Select(s => new { s.StartS, s.EndS, s.Text, s.Speaker }),
