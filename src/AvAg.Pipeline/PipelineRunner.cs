@@ -41,6 +41,9 @@ public sealed class PipelineResult
     public required string TimelineEn { get; init; }
     public Dictionary<string, string> ClipNarratives { get; init; } = new();
     public List<string> Log { get; init; } = new();
+    /// <summary>The screen once per second (grayscale, <see cref="PipelineRunner.ThumbnailWidth"/> px wide), taken from the
+    /// coarse pass so the article does not decode the video again; empty for results that were not produced here.</summary>
+    public IReadOnlyList<GrayFrame> Thumbnails { get; init; } = [];
 }
 
 /// <summary>
@@ -67,63 +70,56 @@ public sealed class PipelineRunner
             // 1. Ingest -------------------------------------------------------------
             var info = await ff.ProbeAsync(videoPath, ct);
             Log($"probe: {info.WidthPx}x{info.HeightPx} @ {info.NominalFps:0.##} fps, {info.DurationS:0.###} s");
+            Elapsed();
 
-            // 2. Audio → ASR → audio references -------------------------------------
-            Transcript transcript;
-            if (await ff.HasAudioAsync(videoPath, ct))
+            // 2+3. Speech recognition and the coarse visual pass are independent: run them at the same time ------
+            var template = _cfg.CursorTemplatePng is null ? null : await LoadTemplateAsync(ff, _cfg.CursorTemplatePng, ct);
+            int coarseW = Math.Min(_cfg.CoarseWidth, info.WidthPx);
+            double sx = (double)info.WidthPx / coarseW;
+            var coarseTemplate = template is null ? null : Downscale(template, 1 / sx);
+            using var both = CancellationTokenSource.CreateLinkedTokenSource(ct);   // one failing stops the other
+            var asrTask = Cancelling(TranscribeAsync(videoPath, work, both.Token), both);
+            var coarseTask = Cancelling(AnalyseAsync(videoPath, _cfg.CoarseFps, null, null, coarseW, coarseTemplate, ThumbnailWidth, both.Token), both);
+            try { await Task.WhenAll(asrTask, coarseTask); }
+            catch when (!ct.IsCancellationRequested)
             {
-                var wav = await ff.ExtractAudioAsync(videoPath, Path.Combine(work, "audio_16k_mono.wav"), ct);
-                transcript = await _svc.Asr.TranscribeAsync(wav, _cfg.LanguageHint, _cfg.Diarize, ct);
-                if (_svc.Asr is Services.IReportsFallback f) foreach (var note in f.FallbackNotes) Log("asr: " + note);
-                int speakers = transcript.Segments.Select(s => s.Speaker).Where(s => s is not null).Distinct().Count();
-                if (speakers > 0) Log($"asr: {speakers} speakers");
+                // Report the real failure, not the cancellation it caused in the other task.
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture((asrTask.IsFaulted ? asrTask.Exception! : coarseTask.Exception!).InnerException!).Throw();
+                throw;
             }
-            else
-            {
-                Log("no audio stream – ASR skipped");
-                transcript = new Transcript("none", new());
-            }
+            var (transcript, asrLog) = asrTask.Result;
+            var coarse = coarseTask.Result;
+            foreach (var line in asrLog) Log(line);
             var audioRefs = new AudioRefParser().Parse(transcript);
             Log($"asr: {transcript.Segments.Count} segments, {transcript.AllWords().Count()} words → {audioRefs.Count} action references");
 
-            // 3. Coarse visual pass -------------------------------------------------
-            var template = _cfg.CursorTemplatePng is null ? null : await LoadTemplateAsync(ff, _cfg.CursorTemplatePng, ct);
-            int coarseW = Math.Min(_cfg.CoarseWidth, info.WidthPx);
-            var coarseFrames = await ff.DecodeGrayFramesAsync(videoPath, _cfg.CoarseFps, scaleWidth: coarseW, ct: ct);
-            double sx = (double)info.WidthPx / coarseW, sy = coarseFrames.Count > 0 ? (double)info.HeightPx / coarseFrames[0].Height : 1;
-            var coarseChanges = new StateChangeDetector().Detect(coarseFrames);
-            var coarseTemplate = template is null ? null : Downscale(template, 1 / sx);
-            var coarseCursor = new CursorTracker { Template = coarseTemplate }.Track(coarseFrames);
-            var events = new ClickCandidateDetector { ScaleX = sx, ScaleY = sy, MaxChangeDelayS = 1.0 / _cfg.CoarseFps + 0.3 }.Detect(coarseCursor, coarseChanges);
-            Log($"coarse: {coarseFrames.Count} frames, {coarseChanges.Count} state changes, {coarseCursor.Count} cursor samples → {events.Count} candidates");
+            double sy = coarse.Height > 0 ? (double)info.HeightPx / coarse.Height : 1;
+            var coarseChanges = new StateChangeDetector().Detect(coarse.Scores);
+            var events = new ClickCandidateDetector { ScaleX = sx, ScaleY = sy, MaxChangeDelayS = 1.0 / _cfg.CoarseFps + 0.3 }.Detect(coarse.Cursor, coarseChanges);
+            Log($"coarse: {coarse.FrameCount} frames, {coarseChanges.Count} state changes, {coarse.Cursor.Count} cursor samples → {events.Count} candidates ({Elapsed()})");
 
-            // 4. Fine pass around every audio reference -----------------------------
-            var fineEvents = new List<VisualEvent>();
-            foreach (var window in MergeWindows(audioRefs.Select(a => (a.AnchorS - _cfg.Fusion.WindowBeforeS, a.AnchorS + _cfg.Fusion.WindowAfterS)), info.DurationS))
+            // 4. Fine pass around every audio reference – windows decoded in parallel --------------------------
+            var windows = MergeWindows(audioRefs.Select(a => (a.AnchorS - _cfg.Fusion.WindowBeforeS, a.AnchorS + _cfg.Fusion.WindowAfterS)), info.DurationS);
+            var fine = new (List<VisualEvent> Cands, string Log)[windows.Count];
+            await Parallel.ForEachAsync(Enumerable.Range(0, windows.Count), new ParallelOptions { MaxDegreeOfParallelism = DecodeParallelism, CancellationToken = ct }, async (i, token) =>
             {
-                var fineFrames = await ff.DecodeGrayFramesAsync(videoPath, _cfg.FineFps, window.start, window.end, ct: ct);
-                var changes = new StateChangeDetector().Detect(fineFrames);
-                var cursor = new CursorTracker { Template = template }.Track(fineFrames);
-                var cands = new ClickCandidateDetector().Detect(cursor, changes);
-                fineEvents.AddRange(cands);
-                Log($"fine [{window.start:0.00}-{window.end:0.00}]: {fineFrames.Count} frames, {changes.Count} changes, {cursor.Count} cursor, {cands.Count} candidates");
-            }
-            events = Deduplicate(events, fineEvents);
+                var (start, end) = windows[i];
+                var a = await AnalyseAsync(videoPath, _cfg.FineFps, start, end, null, template, null, token);
+                var changes = new StateChangeDetector().Detect(a.Scores);
+                var cands = new ClickCandidateDetector().Detect(a.Cursor, changes);
+                fine[i] = (cands, $"fine [{start:0.00}-{end:0.00}]: {a.FrameCount} frames, {changes.Count} changes, {a.Cursor.Count} cursor, {cands.Count} candidates");
+            });
+            foreach (var f in fine) Log(f.Log);
+            events = Deduplicate(events, fine.SelectMany(f => f.Cands).ToList());
+            if (windows.Count > 0) Log($"fine: {windows.Count} windows ({Elapsed()})");
 
             // 5. UI structure + OCR → stable element IDs ----------------------------
             var ui = new UiElementRegistry();
-            foreach (var e in events)
+            if (_svc.UiParser is not NullUiParser)
             {
-                // Frames before the click (target unoccluded, state unchanged) and after (to see the effect).
-                foreach (var t in new[] { Math.Max(0, e.TimeS - 0.3), Math.Min(info.DurationS, e.TimeS + 0.4) })
-                {
-                    var png = await ff.ExtractFramePngAsync(videoPath, t, Path.Combine(work, $"frame_{t:0.000}.png"), ct);
-                    var dets = await _svc.UiParser.ParseAsync(png, ct);
-                    ui.Observe(t, dets);
-                    if (!_cfg.KeepIntermediateFiles) File.Delete(png);
-                }
+                await ParseUiAsync(videoPath, info, events, ui, work, ct);
+                Log($"ui: {ui.Elements.Count} stable elements ({Elapsed()})");
             }
-            Log($"ui: {ui.Elements.Count} stable elements");
 
             // 6. Target assignment + VLM fallback pointing --------------------------
             var finalEvents = new List<VisualEvent>();
@@ -215,7 +211,7 @@ public sealed class PipelineRunner
             {
                 Graph = graph, Transcript = transcript, AudioRefs = audioRefs, VisualEvents = finalEvents,
                 TimelineDe = describer.Timeline(graph, "de"), TimelineEn = describer.Timeline(graph, "en"),
-                ClipNarratives = narratives, Log = _log,
+                ClipNarratives = narratives, Log = _log, Thumbnails = coarse.Thumbnails,
             };
         }
         finally
@@ -225,6 +221,128 @@ public sealed class PipelineRunner
     }
 
     private void Log(string msg) => _log.Add(msg);
+
+    private readonly System.Diagnostics.Stopwatch _stage = System.Diagnostics.Stopwatch.StartNew();
+    /// <summary>Time since the previous call, for the log ("12.3 s").</summary>
+    private string Elapsed()
+    {
+        var s = _stage.Elapsed.TotalSeconds;
+        _stage.Restart();
+        return s.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " s";
+    }
+
+    /// <summary>Width of the 1-fps thumbnails kept for the article (screen changes, keyframes for the language model).</summary>
+    public const int ThumbnailWidth = 160;
+    private static int DecodeParallelism => Math.Clamp(Environment.ProcessorCount / 4, 1, 4);
+
+    private sealed record Analysis(List<FrameScore> Scores, List<CursorSample> Cursor, List<GrayFrame> Thumbnails, int FrameCount, int Height);
+
+    /// <summary>One streaming decode: frame differences, cursor track and (optionally) 1-fps thumbnails, without ever
+    /// holding more than two frames in memory.</summary>
+    private async Task<Analysis> AnalyseAsync(string videoPath, double fps, double? startS, double? endS, int? scaleWidth,
+                                              GrayFrame? template, int? thumbnailWidth, CancellationToken ct)
+    {
+        var detector = new StateChangeDetector();
+        var cursor = new CursorTracker { Template = template }.Start();
+        var scores = new List<FrameScore>();
+        var thumbs = new List<GrayFrame>();
+        GrayFrame? previous = null;
+        int count = 0, height = 0;
+        double nextThumbS = double.NegativeInfinity;
+        await _svc.Ffmpeg.StreamGrayFramesAsync(videoPath, fps, f =>
+        {
+            var prev = previous;
+            Parallel.Invoke(
+                () => { if (prev is not null) scores.Add(detector.Score(prev, f)); },
+                () => cursor.Add(f),
+                () =>
+                {
+                    if (thumbnailWidth is not { } tw || f.PtsS < nextThumbS) return;
+                    thumbs.Add(AreaDownscale(f, tw));
+                    nextThumbS = Math.Floor(f.PtsS) + 1;
+                });
+            previous = f; count++; height = f.Height;
+        }, startS, endS, scaleWidth, ct);
+        return new Analysis(scores, cursor.Samples, thumbs, count, height);
+    }
+
+    private async Task<(Transcript, List<string>)> TranscribeAsync(string videoPath, string work, CancellationToken ct)
+    {
+        var log = new List<string>();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        if (!await _svc.Ffmpeg.HasAudioAsync(videoPath, ct))
+        {
+            log.Add("no audio stream – ASR skipped");
+            return (new Transcript("none", new()), log);
+        }
+        var wav = await _svc.Ffmpeg.ExtractAudioAsync(videoPath, Path.Combine(work, "audio_16k_mono.wav"), ct);
+        var transcript = await _svc.Asr.TranscribeAsync(wav, _cfg.LanguageHint, _cfg.Diarize, ct);
+        if (_svc.Asr is Services.IReportsFallback f) foreach (var note in f.FallbackNotes) log.Add("asr: " + note);
+        int speakers = transcript.Segments.Select(s => s.Speaker).Where(s => s is not null).Distinct().Count();
+        if (speakers > 0) log.Add($"asr: {speakers} speakers");
+        log.Add($"asr: done in {sw.Elapsed.TotalSeconds.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture)} s (in parallel with the coarse pass)");
+        return (transcript, log);
+    }
+
+    /// <summary>If <paramref name="task"/> fails, cancel its sibling.</summary>
+    private static async Task<T> Cancelling<T>(Task<T> task, CancellationTokenSource siblings)
+    {
+        try { return await task; }
+        catch { siblings.Cancel(); throw; }
+    }
+
+    /// <summary>
+    /// Frames before the click (target unoccluded, state unchanged) and after (to see the effect) go to the UI parser –
+    /// only the one before for parsers that read just the region around the click. Frames are extracted in parallel and
+    /// parsed as concurrently as the parser allows; the registry then sees them in time order, so IDs stay stable.
+    /// </summary>
+    private async Task ParseUiAsync(string videoPath, VideoInfo info, List<VisualEvent> events, UiElementRegistry ui, string work, CancellationToken ct)
+    {
+        var parser = _svc.UiParser;
+        var frames = events.SelectMany(e => (parser.ReadsClickRegionOnly ? [-0.3] : new[] { -0.3, 0.4 })
+                .Select(dt => (T: Math.Clamp(e.TimeS + dt, 0, info.DurationS), Focus: e.Point)))
+            .ToList();
+        var results = new (double T, IReadOnlyList<UiElementRegistry.Detection> Dets)[frames.Count];
+        using var parsing = new SemaphoreSlim(Math.Max(1, parser.MaxConcurrency));
+        await Parallel.ForEachAsync(Enumerable.Range(0, frames.Count),
+            new ParallelOptions { MaxDegreeOfParallelism = Math.Max(DecodeParallelism, parser.MaxConcurrency), CancellationToken = ct }, async (i, token) =>
+            {
+                var (t, focus) = frames[i];
+                var png = await _svc.Ffmpeg.ExtractFramePngAsync(videoPath, t, Path.Combine(work, $"frame_{i:0000}_{t:0.000}.png"), token);
+                await parsing.WaitAsync(token);
+                try { results[i] = (t, await parser.ParseAsync(png, focus, token)); }
+                finally
+                {
+                    parsing.Release();
+                    if (!_cfg.KeepIntermediateFiles) File.Delete(png);
+                }
+            });
+        foreach (var (t, dets) in results.OrderBy(r => r.T)) ui.Observe(t, dets);
+    }
+
+    /// <summary>Box-filter downscale (each output pixel is the mean of its source area), like ffmpeg's scale=…:flags=area.</summary>
+    private static GrayFrame AreaDownscale(GrayFrame f, int width)
+    {
+        if (f.Width <= width) return f;
+        int height = Math.Max(2, (int)Math.Round((double)f.Height * width / f.Width / 2) * 2);
+        var px = new byte[width * height];
+        for (int y = 0; y < height; y++)
+        {
+            int y0 = y * f.Height / height, y1 = Math.Max(y0 + 1, (y + 1) * f.Height / height);
+            for (int x = 0; x < width; x++)
+            {
+                int x0 = x * f.Width / width, x1 = Math.Max(x0 + 1, (x + 1) * f.Width / width);
+                long sum = 0;
+                for (int yy = y0; yy < y1; yy++)
+                {
+                    int row = yy * f.Width;
+                    for (int xx = x0; xx < x1; xx++) sum += f.Pixels[row + xx];
+                }
+                px[y * width + x] = (byte)(sum / ((y1 - y0) * (x1 - x0)));
+            }
+        }
+        return new GrayFrame { Index = f.Index, PtsS = f.PtsS, Width = width, Height = height, Pixels = px };
+    }
 
     /// <summary>Merge overlapping analysis windows, clamp to the video duration.</summary>
     public static List<(double start, double end)> MergeWindows(IEnumerable<(double s, double e)> windows, double duration)

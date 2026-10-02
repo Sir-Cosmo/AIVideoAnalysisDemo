@@ -101,10 +101,11 @@ The web app reads them when it runs in Development, which is the case for F5 and
 
 ```powershell
 dotnet user-secrets set "AvAg:Services:TextGenerator:ApiKey" "<your key>" --project src/AvAg.Web
-dotnet user-secrets set "AvAg:Services:Asr:ApiKey"           "<your key>" --project src/AvAg.Web
 ```
 
-On a server, use environment variables instead (`AvAg__Services__TextGenerator__ApiKey`, `AvAg__Services__Asr__ApiKey`).
+One key is enough: every service on `api.openai.com` without a key of its own (speech recognition, screen reading,
+article) uses the key of another OpenAI service, or the `OPENAI_API_KEY` environment variable.
+On a server, use environment variables instead (`AvAg__Services__TextGenerator__ApiKey` or `OPENAI_API_KEY`).
 The CLI reads `OPENAI_API_KEY`. Enable the key check for your commits once per clone:
 
 ```powershell
@@ -137,7 +138,7 @@ Drop the call recording on the page (tick **Private video** if needed) and press
 
 ```powershell
 dotnet build
-dotnet run --project tests/AvAg.Tests     # 28 tests, incl. an end-to-end run on a synthetic screen recording
+dotnet run --project tests/AvAg.Tests     # 40 tests, incl. an end-to-end run on a synthetic screen recording
 ```
 
 ---
@@ -195,13 +196,17 @@ variable-frame-rate recordings keep correct times. The WAV and frames live in a 
   aligner isn't running, word times are spread over the segment and the log says so.
 * Alternatives: `whisper-1` gives word times itself but no speakers. `Prompt` passes product names and
   abbreviations (not supported by the diarize model).
+* **Long calls:** one request takes at most 1400 s (23 min). A longer call is cut at pauses into parts of about
+  20 min. The first part is transcribed alone; its speakers (a few seconds of each voice) go to the other parts as
+  `known_speaker_references`, so `SPEAKER_A` stays the same person for the whole call. The other parts run in parallel.
 * If OpenAI fails (no network, no credit, invalid key, timeout), the configured **fallback**, the local WhisperX,
   transcribes instead. The job log says why.
 
 **Local WhisperX (fallback, or the only engine without OpenAI):**
 `sidecars/whisperx_server.py` is a small FastAPI service (`POST /transcribe {audio_path, language, diarize}`):
 
-1. **Transcription:** faster-whisper. `large-v3` on GPUs with ≥ 8 GB or on the CPU, `medium` on smaller GPUs.
+1. **Transcription:** faster-whisper. `large-v3` on GPUs with ≥ 8 GB, `large-v3-turbo` on smaller GPUs and the CPU
+   (nearly as accurate as `large-v3`, several times faster, and clearly better than the former `medium`).
 2. **Word alignment:** every word gets a start and end time. These timings tie speech to clicks.
 3. **Speakers (optional):** pyannote, when `HF_TOKEN` is set.
 
@@ -223,6 +228,27 @@ right-click, drag, type, select, scroll …. It notes deictic words ("hier", "th
 
 A coarse pass (3 fps) covers the whole video. A fine pass (20 fps, full resolution) re-checks the window around
 every spoken instruction.
+
+### 3.4a Reading the screen (UiParser)
+
+The default `openai-vision` provider sends the region around each click (640 × 400 px of the frame before the click)
+to GPT-5.5 (`ReasoningEffort: low`). It returns the UI elements there with their exact texts and boxes, so a click is
+named ("„Speichern“ anklicken") even when nobody said the button's name, and the article model gets the real menu
+and button names. Six frames are read at a time; a frame that fails after three retries is skipped and counted in
+the log. Private videos never use it (local services only); the local alternative is the OmniParser sidecar
+(`omniparser`), or `none`.
+
+### 3.4b Speed
+
+* Speech recognition runs **at the same time** as the coarse visual pass.
+* Frames are **streamed** from ffmpeg and analysed as they arrive: memory stays at about 100 MB however long the
+  video is (before: every frame of the coarse pass in memory, about 1.5 GB for 5 min of 1080p).
+* The fine-pass windows, the frames for screen reading and the article screenshots are decoded in parallel.
+* The article reuses the 1-fps thumbnails of the analysis instead of decoding the whole video again.
+* The log shows the time of every stage.
+
+On a 5-minute 1080p test recording (16 cores) the analysis plus a rule-based article went from 24 s to under 10 s,
+with identical results.
 
 ### 3.5 Fusion and grounding status
 
@@ -501,7 +527,7 @@ Other commands: `avag eval --pred <graph.json> --gt <groundtruth.json>` and `ava
       "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-4o-transcribe-diarize", "AlignUrl": "http://127.0.0.1:8011",
       "Fallback": { "Provider": "whisperx", "Url": "http://127.0.0.1:8011", "LocalModule": "whisperx_server:app" }
     },
-    "UiParser": { "Provider": "none" }, "Grounder": {}, "Tracker": { "Provider": "none" }, "ClipDescriber": { "Provider": "none" },
+    "UiParser": { "Provider": "openai-vision", "Url": "https://api.openai.com/v1", "Model": "gpt-5.5", "ReasoningEffort": "low" }, "Grounder": {}, "Tracker": { "Provider": "none" }, "ClipDescriber": { "Provider": "none" },
     "TextGenerator": {
       "Provider": "openai", "Url": "https://api.openai.com/v1", "Model": "gpt-5.5", "Vision": true, "ReasoningEffort": "medium", "TimeoutSeconds": 600,
       "Fallback": { "Provider": "ollama", "Url": "http://127.0.0.1:11434/v1", "Model": "avag-article", "TimeoutSeconds": 900 }
@@ -545,7 +571,7 @@ The pipeline only knows six small interfaces (`src/AvAg.Core/Abstractions/AiServ
 | Capability (config key) | Interface | Built-in providers |
 |---|---|---|
 | Speech recognition (`Asr`) | `IAsrService` | `whisperx` (default), `whisperx-json` (transcript file), `openai` (`gpt-4o-transcribe-diarize` up to 23 min, `whisper-1`; text-only models are refused) |
-| UI elements + text (`UiParser`) | `IUiParser` | `omniparser` (default), `ui-json` (file) |
+| UI elements + text (`UiParser`) | `IUiParser` | `openai-vision` (GPT vision around the click, shipped config), `omniparser` (default for a bare URL), `ui-json` (file) |
 | Fallback pointing (`Grounder`) | `IVideoGrounder` | `molmo` (default), `qwen-vl` |
 | Box tracking (`Tracker`) | `IObjectTracker` | `sam2` |
 | Clip narratives (`ClipDescriber`) | `IClipDescriber` | `qwen-vl` (a Qwen-VL describer also serves as fallback pointing unless a grounder is configured) |
@@ -566,7 +592,7 @@ Reasoning models (gpt-5…, o3/o4) automatically get `max_completion_tokens`, no
 and the provider name in the configuration. [`docs/ADDING_AN_AI.md`](docs/ADDING_AN_AI.md) has a complete
 example. The prompt, the checks, the redaction, the screenshots and the Markdown stay the same.
 
-WhisperX environment variables: `AVAG_WHISPER_MODEL` (`large-v3`, `medium`, `small` …), `AVAG_WHISPER_DEVICE`
+WhisperX environment variables: `AVAG_WHISPER_MODEL` (`large-v3`, `large-v3-turbo`, `medium` …), `AVAG_WHISPER_DEVICE`
 (`cuda`/`cpu`), `AVAG_WHISPER_COMPUTE`, `AVAG_WHISPER_BATCH`, `HF_TOKEN` (speaker labels).
 Article model: `sidecars/article-llm.Modelfile` (`FROM qwen2.5:7b`, `num_gpu 0`, `num_ctx 12288`); after changing
 it run `ollama create avag-article -f sidecars/article-llm.Modelfile` again.
@@ -579,7 +605,7 @@ it run `ollama create avag-article -f sidecars/article-llm.Modelfile` again.
 |---|---|---|---|
 | OpenAI API | – (HTTPS) | per request | speech recognition and article (when configured and credited) |
 | AvAg.Web | 5080 (localhost) | Visual Studio / `dotnet run` | CPU, RAM for frames during analysis |
-| WhisperX (`sidecars/whisperx_server.py`) | 8011 | AvAg.Web, when a job needs it | word alignment for OpenAI transcripts (small), or full speech recognition as fallback (GPU ≈3 GB with `medium`, or CPU) |
+| WhisperX (`sidecars/whisperx_server.py`) | 8011 | AvAg.Web, when a job needs it | word alignment for OpenAI transcripts (small), or full speech recognition as fallback (GPU ≈3 GB with `large-v3-turbo`, or CPU) |
 | Ollama (`avag-article`) | 11434 | Windows autostart of Ollama | CPU only, ≈5.5 GB RAM while loaded (unloads after 5 idle minutes) |
 | FFmpeg | – | short-lived, per step | CPU |
 

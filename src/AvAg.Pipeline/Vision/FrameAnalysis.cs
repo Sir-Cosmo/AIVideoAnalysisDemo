@@ -5,6 +5,9 @@ namespace AvAg.Pipeline.Vision;
 
 public sealed record StateChange(double TimeS, double Magnitude, double Confidence, BBox Region);
 
+/// <summary>How much frame <see cref="TimeS"/> differs from the frame before it (see <see cref="StateChangeDetector.Score"/>).</summary>
+public sealed record FrameScore(double TimeS, double Fraction, BBox Region);
+
 /// <summary>
 /// Detects UI state changes by block-wise frame differencing. A change is a local maximum of the
 /// mean absolute difference above <see cref="Threshold"/>; its region is the bounding box of the changed blocks.
@@ -19,20 +22,32 @@ public sealed class StateChangeDetector
 
     public List<StateChange> Detect(IReadOnlyList<GrayFrame> frames)
     {
-        var changes = new List<StateChange>();
-        if (frames.Count < 2) return changes;
-        var scores = new double[frames.Count];
-        var regions = new BBox?[frames.Count];
-        for (int i = 1; i < frames.Count; i++)
-            (scores[i], regions[i]) = BlockDiff(frames[i - 1], frames[i]);
+        if (frames.Count < 2) return new();
+        // Frame pairs are independent: score them on all cores.
+        var scores = new FrameScore[frames.Count - 1];
+        Parallel.For(1, frames.Count, i => scores[i - 1] = Score(frames[i - 1], frames[i]));
+        return Detect(scores);
+    }
 
-        for (int i = 1; i < frames.Count; i++)
+    /// <summary>The difference between two consecutive frames: fraction of changed blocks and their bounding box.</summary>
+    public FrameScore Score(GrayFrame previous, GrayFrame frame)
+    {
+        var (fraction, region) = BlockDiff(previous, frame);
+        return new FrameScore(frame.PtsS, fraction, region ?? new BBox(0, 0, frame.Width, frame.Height));
+    }
+
+    /// <summary>State changes from the scores of consecutive frames (index i = frame i+1 against frame i).</summary>
+    public List<StateChange> Detect(IReadOnlyList<FrameScore> scores)
+    {
+        var changes = new List<StateChange>();
+        for (int i = 0; i < scores.Count; i++)
         {
-            if (scores[i] < Threshold) continue;
-            bool localMax = (i == 1 || scores[i] >= scores[i - 1]) && (i == frames.Count - 1 || scores[i] > scores[i + 1]);
+            double v = scores[i].Fraction;
+            if (v < Threshold) continue;
+            bool localMax = (i == 0 || v >= scores[i - 1].Fraction) && (i == scores.Count - 1 || v > scores[i + 1].Fraction);
             if (!localMax) continue;
-            double conf = Math.Clamp(scores[i] / (Threshold * 20), 0.3, 0.98);
-            changes.Add(new StateChange(frames[i].PtsS, scores[i], conf, regions[i] ?? new BBox(0, 0, frames[i].Width, frames[i].Height)));
+            double conf = Math.Clamp(v / (Threshold * 20), 0.3, 0.98);
+            changes.Add(new StateChange(scores[i].TimeS, v, conf, scores[i].Region));
         }
         return changes;
     }
@@ -82,34 +97,51 @@ public sealed class CursorTracker
     public int MinBlobPixels { get; init; } = 4;
     public int DiffThreshold { get; init; } = 40;
 
-    public List<CursorSample> Track(IReadOnlyList<GrayFrame> frames) =>
-        Template is not null ? TrackByTemplate(frames) : TrackByMotion(frames);
-
-    private List<CursorSample> TrackByTemplate(IReadOnlyList<GrayFrame> frames)
+    public List<CursorSample> Track(IReadOnlyList<GrayFrame> frames)
     {
-        var samples = new List<CursorSample>();
-        var tpl = Template!;
-        (int x, int y)? last = null;
-        foreach (var f in frames)
+        var session = Start();
+        foreach (var f in frames) session.Add(f);
+        return session.Samples;
+    }
+
+    /// <summary>Tracks frame by frame as they are decoded (constant memory: only the previous frame is kept).</summary>
+    public Session Start() => new(this);
+
+    public sealed class Session
+    {
+        private readonly CursorTracker _t;
+        private GrayFrame? _previous;
+        private (int x, int y)? _last;
+        internal Session(CursorTracker t) => _t = t;
+        public List<CursorSample> Samples { get; } = new();
+
+        public void Add(GrayFrame f)
         {
-            int x0 = 0, y0 = 0, x1 = f.Width - tpl.Width, y1 = f.Height - tpl.Height;
-            if (last is { } l)
-            {
-                x0 = Math.Max(0, l.x - SearchRadius); y0 = Math.Max(0, l.y - SearchRadius);
-                x1 = Math.Min(x1, l.x + SearchRadius); y1 = Math.Min(y1, l.y + SearchRadius);
-            }
-            var (bx, by, err) = BestMatch(f, tpl, x0, y0, x1, y1, 2);
-            if (err > MaxTemplateError && last is not null)
-                (bx, by, err) = BestMatch(f, tpl, 0, 0, f.Width - tpl.Width, f.Height - tpl.Height, 3); // re-acquire
-            if (err <= MaxTemplateError)
-            {
-                last = (bx, by);
-                // Hot-spot: assume the pointer tip is the template's top-left corner.
-                samples.Add(new CursorSample(f.PtsS, bx, by, Math.Clamp(1.0 - err / MaxTemplateError, 0.2, 0.98)));
-            }
-            else last = null;
+            if (_t.Template is not null) _last = _t.TrackByTemplate(f, _last, Samples);
+            else if (_previous is not null) _last = _t.TrackByMotion(_previous, f, _last, Samples);
+            _previous = f;
         }
-        return samples;
+    }
+
+    private (int x, int y)? TrackByTemplate(GrayFrame f, (int x, int y)? last, List<CursorSample> samples)
+    {
+        var tpl = Template!;
+        int x0 = 0, y0 = 0, x1 = f.Width - tpl.Width, y1 = f.Height - tpl.Height;
+        if (last is { } l)
+        {
+            x0 = Math.Max(0, l.x - SearchRadius); y0 = Math.Max(0, l.y - SearchRadius);
+            x1 = Math.Min(x1, l.x + SearchRadius); y1 = Math.Min(y1, l.y + SearchRadius);
+        }
+        var (bx, by, err) = BestMatch(f, tpl, x0, y0, x1, y1, 2);
+        if (err > MaxTemplateError && last is not null)
+            (bx, by, err) = BestMatch(f, tpl, 0, 0, f.Width - tpl.Width, f.Height - tpl.Height, 3); // re-acquire
+        if (err <= MaxTemplateError)
+        {
+            // Hot-spot: assume the pointer tip is the template's top-left corner.
+            samples.Add(new CursorSample(f.PtsS, bx, by, Math.Clamp(1.0 - err / MaxTemplateError, 0.2, 0.98)));
+            return (bx, by);
+        }
+        return null;
     }
 
     private static (int x, int y, double err) BestMatch(GrayFrame f, GrayFrame tpl, int x0, int y0, int x1, int y1, int step)
@@ -145,41 +177,35 @@ public sealed class CursorTracker
         return (double)sum / n;
     }
 
-    private List<CursorSample> TrackByMotion(IReadOnlyList<GrayFrame> frames)
+    private (int x, int y)? TrackByMotion(GrayFrame a, GrayFrame b, (int x, int y)? last, List<CursorSample> samples)
     {
-        var samples = new List<CursorSample>();
-        (int x, int y)? last = null;
-        for (int i = 1; i < frames.Count; i++)
+        // Pixels that are bright in b and differ from a → candidate new cursor position (cursor is usually light with dark outline or vice versa).
+        int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1, count = 0; long sx = 0, sy = 0;
+        for (int y = 0; y < b.Height; y++)
         {
-            var a = frames[i - 1]; var b = frames[i];
-            // Pixels that are bright in b and differ from a → candidate new cursor position (cursor is usually light with dark outline or vice versa).
-            int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1, count = 0; long sx = 0, sy = 0;
-            for (int y = 0; y < b.Height; y++)
+            int row = y * b.Width;
+            for (int x = 0; x < b.Width; x++)
             {
-                int row = y * b.Width;
-                for (int x = 0; x < b.Width; x++)
+                int d = b.Pixels[row + x] - a.Pixels[row + x];
+                if (d >= DiffThreshold)
                 {
-                    int d = b.Pixels[row + x] - a.Pixels[row + x];
-                    if (d >= DiffThreshold)
-                    {
-                        count++; sx += x; sy += y;
-                        if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y;
-                    }
+                    count++; sx += x; sy += y;
+                    if (x < minX) minX = x; if (y < minY) minY = y; if (x > maxX) maxX = x; if (y > maxY) maxY = y;
                 }
             }
-            if (count >= MinBlobPixels && (maxX - minX) <= MaxBlobSize && (maxY - minY) <= MaxBlobSize)
-            {
-                // Use the top-left of the appeared blob as the pointer tip (arrow cursors point to their top-left).
-                last = (minX, minY);
-                samples.Add(new CursorSample(b.PtsS, minX, minY, 0.75));
-            }
-            else if (last is { } l && count < MinBlobPixels)
-            {
-                // Cursor is stationary: carry the last position forward with slightly lower confidence.
-                samples.Add(new CursorSample(b.PtsS, l.x, l.y, 0.7));
-            }
         }
-        return samples;
+        if (count >= MinBlobPixels && (maxX - minX) <= MaxBlobSize && (maxY - minY) <= MaxBlobSize)
+        {
+            // Use the top-left of the appeared blob as the pointer tip (arrow cursors point to their top-left).
+            last = (minX, minY);
+            samples.Add(new CursorSample(b.PtsS, minX, minY, 0.75));
+        }
+        else if (last is { } l && count < MinBlobPixels)
+        {
+            // Cursor is stationary: carry the last position forward with slightly lower confidence.
+            samples.Add(new CursorSample(b.PtsS, l.x, l.y, 0.7));
+        }
+        return last;
     }
 }
 

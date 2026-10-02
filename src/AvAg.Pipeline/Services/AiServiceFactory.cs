@@ -83,7 +83,10 @@ public sealed class AiServiceFactory
              .Register("whisperx-json", o => new JsonFileAsr(f.Asr.RequirePath(o)))
              .Register("openai", o => new OpenAiTranscriber(f.Asr.RequireUrl(o), o.Model, o.ApiKey, f.Asr.Timeout(o), o.Prompt, o.AlignUrl));
         f.UiParser.Register("omniparser", o => new OmniParserSidecar(f.UiParser.RequireUrl(o), o.ApiKey, f.UiParser.Timeout(o)))
-                  .Register("ui-json", o => new JsonFileUiParser(f.UiParser.RequirePath(o)));
+                  .Register("ui-json", o => new JsonFileUiParser(f.UiParser.RequirePath(o)))
+                  // One request per frame: a short timeout (default 2 min), not the sidecars' 30 min.
+                  .Register("openai-vision", o => new VisionLlmUiParser(new OpenAiCompatibleTextGenerator(f.UiParser.RequireUrl(o), o.Model, o.ApiKey,
+                      o.TimeoutOr(TimeSpan.FromMinutes(2)), vision: true, o.ReasoningEffort)), "vision-llm");
         f.Grounder.Register("molmo", o => new MolmoPointSidecar(f.Grounder.RequireUrl(o), o.ApiKey, f.Grounder.Timeout(o)))
                   .Register("qwen-vl", o => new Qwen3VlClient(f.Grounder.RequireUrl(o), o.Model, o.ApiKey, f.Grounder.Timeout(o)));
         f.Tracker.Register("sam2", o => new Sam2Sidecar(f.Tracker.RequireUrl(o), o.ApiKey, f.Tracker.Timeout(o)));

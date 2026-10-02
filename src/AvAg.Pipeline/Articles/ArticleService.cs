@@ -71,7 +71,7 @@ public sealed class ArticleService
                 // Images are a help, not a requirement: without them the model still writes from the text.
                 try
                 {
-                    var screens = await _screenshots.KeyframesAsync(videoPath, result.Graph, ct);
+                    var screens = await _screenshots.KeyframesAsync(videoPath, result.Graph, ct, thumbnails: result.Thumbnails);
                     input = input with { Screens = screens };
                     Add($"{screens.Count} screen images sent to the language model");
                 }

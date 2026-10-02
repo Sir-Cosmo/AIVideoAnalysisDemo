@@ -156,6 +156,20 @@ public sealed class AiServicesOptions
     /// <summary>Every configured service including fallbacks – for starting local sidecars.</summary>
     public IEnumerable<ServiceOptions> All => Primaries.SelectMany(o => o.WithFallbacks());
 
+    /// <summary>
+    /// One OpenAI key for all OpenAI services: a service on api.openai.com without its own key gets the key of another
+    /// OpenAI service here, else <paramref name="fallbackKey"/> (e.g. the OPENAI_API_KEY environment variable). Keys are
+    /// only ever passed between services on the same host.
+    /// </summary>
+    public AiServicesOptions ShareOpenAiKey(string? fallbackKey = null)
+    {
+        static bool IsOpenAi(ServiceOptions o) => Uri.TryCreate(o.Url, UriKind.Absolute, out var u) && u.Host.Equals("api.openai.com", StringComparison.OrdinalIgnoreCase);
+        var key = All.Where(IsOpenAi).Select(o => o.ApiKey).FirstOrDefault(k => !string.IsNullOrWhiteSpace(k)) ?? fallbackKey;
+        if (string.IsNullOrWhiteSpace(key)) return this;
+        foreach (var o in All.Where(o => IsOpenAi(o) && string.IsNullOrWhiteSpace(o.ApiKey))) o.ApiKey = key;
+        return this;
+    }
+
     /// <summary>For private videos: every capability restricted to services on this machine or in the local network.
     /// Cloud services (OpenAI, …) are dropped from each chain; a capability with no local service is off.</summary>
     public AiServicesOptions LocalOnly() => new()

@@ -497,6 +497,51 @@ static class Tests
         Directory.Delete(dir, true);
     }
 
+    [Test] public static async Task Vision_Ui_Parser_Reads_The_Region_Around_The_Click()
+    {
+        var dir = Directory.CreateTempSubdirectory("avag_vision").FullName;
+        var png = Path.Combine(dir, "f.png");
+        await FfmpegService.RunAsync("ffmpeg", ["-y", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=gray:s=1920x1080", "-frames:v", "1", png], null, default);
+        var llm = new FakeTextGenerator("""{"elements":[{"text":"Speichern","type":"button","interactive":true,"box":[10,20,90,44]},{"text":"x","box":[1,2]}]}""");
+        IUiParser parser = new VisionLlmUiParser(llm);
+        var dets = await parser.ParseAsync(png, new Point2D(1500, 900));
+        var d = dets.Single();
+        Assert.True(d.Text == "Speichern" && d.Bbox == new BBox(1190, 700, 1270, 724) && d.InteractiveConfidence > 0.8, "box moved back onto the full frame: " + d.Bbox);
+        Assert.True(llm.LastRequest!.User.Contains("x=320, y=220") && llm.LastRequest.Images.Count == 1, "click point given in crop pixels");
+        Assert.True(parser.ReadsClickRegionOnly && parser.MaxConcurrency > 1, "one frame per click, several at a time");
+        Directory.Delete(dir, true);
+    }
+
+    [Test] public static async Task Long_Calls_Are_Transcribed_In_Parts_With_The_Same_Speakers()
+    {
+        Assert.True(OpenAiTranscriber.SplitAtPauses(3000, 1400, [(1100, 1101), (500, 503)]) is [(0, 1100.5), (1100.5, _), ..], "cut in a pause near the limit");
+
+        var dir = Directory.CreateTempSubdirectory("avag_parts").FullName;
+        var wav = Path.Combine(dir, "a.wav");
+        await FfmpegService.RunAsync("ffmpeg", ["-y", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=150", "-ac", "1", "-ar", "16000", wav], null, default);
+        var http = new FakeHttp((_, _) => (200, """{"segments":[{"start":1,"end":7,"text":"Klicken Sie hier auf Speichern.","speaker":"A"}]}"""));
+        var asr = new OpenAiTranscriber("https://api.openai.com/v1", null, "k", TimeSpan.FromSeconds(30), http: new HttpClient(http)) { MaxRequestSeconds = 100 };
+        var t = await asr.TranscribeAsync(wav, null, diarize: true);
+        Assert.Eq(3, http.Calls.Count, "three parts of at most 60 s");
+        Assert.True(http.Calls.Count(c => c.Body.Contains("known_speaker_names[]") && c.Body.Contains("data:audio/mpeg;base64,")) == 2, "later parts know the first part's speakers");
+        Assert.True(t.Segments.Select(s => s.StartS).SequenceEqual([1.0, 61.0, 121.0]) && t.Segments.All(s => s.Speaker == "SPEAKER_A"), "times on the whole call, same speaker");
+        Assert.True(asr.FallbackNotes.Any(n => n.Contains("3 parts")), "logged");
+        Directory.Delete(dir, true);
+    }
+
+    [Test] public static void One_OpenAI_Key_Serves_All_OpenAI_Services()
+    {
+        var cfg = new AiServicesOptions
+        {
+            Asr = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1" },
+            UiParser = new ServiceOptions { Provider = "openai-vision", Url = "https://api.openai.com/v1" },
+            TextGenerator = new ServiceOptions { Provider = "openai", Url = "https://api.openai.com/v1", ApiKey = "sk-test",
+                                                 Fallback = new ServiceOptions { Provider = "ollama", Url = "http://127.0.0.1:11434/v1" } },
+        }.ShareOpenAiKey();
+        Assert.True(cfg.Asr.ApiKey == "sk-test" && cfg.UiParser.ApiKey == "sk-test", "OpenAI services share the key");
+        Assert.True(cfg.TextGenerator.Fallback!.ApiKey is null, "never to another host");
+    }
+
     [Test] public static void Sidecar_Json_Is_Read_As_Snake_Case()
     {
         var p = System.Text.Json.JsonSerializer.Deserialize<VideoPoint>("""{"object_id":"btn","time_s":12.5,"x":10,"y":20,"confidence":0.9,"label":"OK"}""", Json.Options)!;
@@ -538,7 +583,7 @@ static class Tests
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             string body = request.Content is null ? "" : await request.Content.ReadAsStringAsync(ct);
-            Calls.Add((request, body));
+            lock (Calls) Calls.Add((request, body));
             var (status, text) = respond(request, body);
             return new HttpResponseMessage((System.Net.HttpStatusCode)status) { Content = new StringContent(text) };
         }

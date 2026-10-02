@@ -19,6 +19,17 @@ public interface IAsrService
 public interface IUiParser
 {
     Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, CancellationToken ct = default);
+
+    /// <summary>Parses a frame in which the user clicks at <paramref name="click"/> (source pixels, null = unknown).
+    /// Parsers that only read the region around the click use it; the others parse the whole frame.</summary>
+    Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, Point2D? click, CancellationToken ct = default) =>
+        ParseAsync(framePngPath, ct);
+
+    /// <summary>How many frames may be parsed at the same time: 1 for a local GPU sidecar, more for a cloud model.</summary>
+    int MaxConcurrency => 1;
+
+    /// <summary>Reads only the region around the click: the frame before the click is enough (no frame after it).</summary>
+    bool ReadsClickRegionOnly => false;
 }
 
 /// <summary>A spatio-temporal point produced by a video grounder.</summary>

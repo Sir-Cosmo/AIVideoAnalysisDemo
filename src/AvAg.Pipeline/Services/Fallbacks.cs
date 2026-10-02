@@ -93,6 +93,11 @@ public sealed class FallbackUiParser(IUiParser primary, string primaryName, IUiP
     public IReadOnlyList<string> FallbackNotes => _f.Notes;
     public Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, CancellationToken ct = default) =>
         _f.RunAsync(s => s.ParseAsync(framePngPath, ct), ct);
+    public Task<IReadOnlyList<UiElementRegistry.Detection>> ParseAsync(string framePngPath, Point2D? click, CancellationToken ct = default) =>
+        _f.RunAsync(s => s.ParseAsync(framePngPath, click, ct), ct);
+    // The fallback may be a local sidecar that takes one frame at a time and needs both frames.
+    public int MaxConcurrency => Math.Min(primary.MaxConcurrency, fallback.MaxConcurrency);
+    public bool ReadsClickRegionOnly => primary.ReadsClickRegionOnly && fallback.ReadsClickRegionOnly;
 }
 
 public sealed class FallbackGrounder(IVideoGrounder primary, string primaryName, IVideoGrounder fallback, string fallbackName) : IVideoGrounder, IReportsFallback
